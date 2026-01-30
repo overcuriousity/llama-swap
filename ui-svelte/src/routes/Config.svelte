@@ -19,6 +19,7 @@
   let exampleEditorContainer = $state<HTMLDivElement>();
   let editor: any;
   let exampleEditor: any;
+  let editorsInitialized = $state(false);
 
   async function loadConfig() {
     isLoading = true;
@@ -175,76 +176,76 @@
   }
 
   onMount(async () => {
-    // Load config first so DOM is rendered
     await loadConfig();
+  });
 
-    // Wait for Svelte to update the DOM
-    await tick();
-
-    // Ensure containers exist before proceeding
-    if (!editorContainer || !exampleEditorContainer) {
-      console.error('Editor containers not found after tick()');
-      error = 'Failed to load code editor. Using fallback.';
+  // Initialize editors when containers become available
+  $effect(() => {
+    if (!editorContainer || !exampleEditorContainer || editorsInitialized || isLoading) {
       return;
     }
 
+    editorsInitialized = true;
+
     // Dynamically import Monaco editor
-    try {
-      const monaco = await import('monaco-editor');
+    (async () => {
+      try {
+        const monaco = await import('monaco-editor');
 
-      // Configure Monaco
-      monaco.editor.defineTheme('vs-dark-custom', {
-        base: 'vs-dark',
-        inherit: true,
-        rules: [],
-        colors: {}
-      });
+        // Configure Monaco
+        monaco.editor.defineTheme('vs-dark-custom', {
+          base: 'vs-dark',
+          inherit: true,
+          rules: [],
+          colors: {}
+        });
 
-      // Create main editor
-      editor = monaco.editor.create(editorContainer, {
-        value: configContent,
-        language: 'yaml',
-        theme: $isDarkMode ? 'vs-dark' : 'vs',
-        minimap: { enabled: true },
-        scrollBeyondLastLine: false,
-        fontSize: 14,
-        wordWrap: 'on',
-        automaticLayout: true,
-      });
+        // Create main editor
+        editor = monaco.editor.create(editorContainer, {
+          value: configContent,
+          language: 'yaml',
+          theme: $isDarkMode ? 'vs-dark' : 'vs',
+          minimap: { enabled: true },
+          scrollBeyondLastLine: false,
+          fontSize: 14,
+          wordWrap: 'on',
+          automaticLayout: true,
+        });
 
-      editor.onDidChangeModelContent(() => {
-        handleEditorChange(editor.getValue());
-      });
+        editor.onDidChangeModelContent(() => {
+          handleEditorChange(editor.getValue());
+        });
 
-      // Create example editor
-      exampleEditor = monaco.editor.create(exampleEditorContainer, {
-        value: EXAMPLE_CONFIG,
-        language: 'yaml',
-        theme: $isDarkMode ? 'vs-dark' : 'vs',
-        readOnly: true,
-        minimap: { enabled: false },
-        scrollBeyondLastLine: false,
-        fontSize: 12,
-        wordWrap: 'on',
-        automaticLayout: true,
-        lineNumbers: 'on',
-      });
+        // Create example editor
+        exampleEditor = monaco.editor.create(exampleEditorContainer, {
+          value: EXAMPLE_CONFIG,
+          language: 'yaml',
+          theme: $isDarkMode ? 'vs-dark' : 'vs',
+          readOnly: true,
+          minimap: { enabled: false },
+          scrollBeyondLastLine: false,
+          fontSize: 12,
+          wordWrap: 'on',
+          automaticLayout: true,
+          lineNumbers: 'on',
+        });
 
-      // Update theme when it changes
-      const unsubscribe = isDarkMode.subscribe(dark => {
-        if (editor) editor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
-        if (exampleEditor) exampleEditor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
-      });
+        // Update theme when it changes
+        const unsubscribe = isDarkMode.subscribe(dark => {
+          if (editor) editor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
+          if (exampleEditor) exampleEditor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
+        });
 
-      return () => {
-        unsubscribe();
-        editor?.dispose();
-        exampleEditor?.dispose();
-      };
-    } catch (err) {
-      console.error('Failed to load Monaco editor:', err);
-      error = 'Failed to load code editor. Using fallback.';
-    }
+        return () => {
+          unsubscribe();
+          editor?.dispose();
+          exampleEditor?.dispose();
+        };
+      } catch (err) {
+        console.error('Failed to load Monaco editor:', err);
+        error = 'Failed to load code editor. Using fallback.';
+      }
+    })();
   });
 </script>
 

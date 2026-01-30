@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { fetchConfig, saveConfig } from "../stores/api";
   import { isDarkMode, isNarrow } from "../stores/theme";
   import ResizablePanels from "../components/ResizablePanels.svelte";
@@ -178,8 +178,8 @@
     // Load config first so DOM is rendered
     await loadConfig();
 
-    // Wait for next tick to ensure DOM is ready
-    await new Promise(resolve => setTimeout(resolve, 0));
+    // Wait for Svelte to update the DOM
+    await tick();
 
     // Dynamically import Monaco editor
     try {

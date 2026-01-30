@@ -187,6 +187,8 @@
 
     editorsInitialized = true;
 
+    let unsubscribe: (() => void) | undefined;
+
     // Dynamically import Monaco editor
     (async () => {
       try {
@@ -201,7 +203,7 @@
         });
 
         // Create main editor
-        editor = monaco.editor.create(editorContainer, {
+        editor = monaco.editor.create(editorContainer!, {
           value: configContent,
           language: 'yaml',
           theme: $isDarkMode ? 'vs-dark' : 'vs',
@@ -217,7 +219,7 @@
         });
 
         // Create example editor
-        exampleEditor = monaco.editor.create(exampleEditorContainer, {
+        exampleEditor = monaco.editor.create(exampleEditorContainer!, {
           value: EXAMPLE_CONFIG,
           language: 'yaml',
           theme: $isDarkMode ? 'vs-dark' : 'vs',
@@ -231,21 +233,21 @@
         });
 
         // Update theme when it changes
-        const unsubscribe = isDarkMode.subscribe(dark => {
+        unsubscribe = isDarkMode.subscribe(dark => {
           if (editor) editor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
           if (exampleEditor) exampleEditor.updateOptions({ theme: dark ? 'vs-dark' : 'vs' });
         });
-
-        return () => {
-          unsubscribe();
-          editor?.dispose();
-          exampleEditor?.dispose();
-        };
       } catch (err) {
         console.error('Failed to load Monaco editor:', err);
         error = 'Failed to load code editor. Using fallback.';
       }
     })();
+
+    return () => {
+      unsubscribe?.();
+      editor?.dispose();
+      exampleEditor?.dispose();
+    };
   });
 </script>
 

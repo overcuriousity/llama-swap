@@ -172,3 +172,36 @@ export async function loadModel(model: string): Promise<void> {
     throw error;
   }
 }
+
+export async function fetchConfig(): Promise<{ path: string; content: string }> {
+  try {
+    const response = await fetch("/api/config");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch config: ${response.status}`);
+    }
+    const data = await response.json();
+    return { path: data.path, content: data.content };
+  } catch (error) {
+    console.error("Failed to fetch config:", error);
+    throw error;
+  }
+}
+
+export async function saveConfig(content: string): Promise<void> {
+  try {
+    const response = await fetch("/api/config", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content }),
+    });
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || `Failed to save config: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to save config:", error);
+    throw error;
+  }
+}

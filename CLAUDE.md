@@ -5,7 +5,7 @@ llama-swap is a light weight, transparent proxy server that provides automatic m
 ## Tech stack
 
 - golang
-- typescript, vite and react for UI (located in ui/)
+- typescript, vite and svelte for UI (located in ui-svelte/)
 
 ## Workflow Tasks
 

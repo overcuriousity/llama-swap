@@ -52,6 +52,9 @@ type ProxyManager struct {
 	commit    string
 	version   string
 
+	// config file path for editing
+	configPath string
+
 	// peer proxy see: #296, #433
 	peerProxy *PeerProxy
 }
@@ -984,4 +987,10 @@ func (pm *ProxyManager) SetVersion(buildDate string, commit string, version stri
 	pm.buildDate = buildDate
 	pm.commit = commit
 	pm.version = version
+}
+
+func (pm *ProxyManager) SetConfigPath(configPath string) {
+	pm.Lock()
+	defer pm.Unlock()
+	pm.configPath = configPath
 }

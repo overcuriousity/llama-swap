@@ -175,6 +175,12 @@
   }
 
   onMount(async () => {
+    // Load config first so DOM is rendered
+    await loadConfig();
+
+    // Wait for next tick to ensure DOM is ready
+    await new Promise(resolve => setTimeout(resolve, 0));
+
     // Dynamically import Monaco editor
     try {
       const monaco = await import('monaco-editor');
@@ -232,8 +238,6 @@
       console.error('Failed to load Monaco editor:', err);
       error = 'Failed to load code editor. Using fallback.';
     }
-
-    await loadConfig();
   });
 </script>
 

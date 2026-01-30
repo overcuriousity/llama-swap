@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
+	"github.com/mostlygeek/llama-swap/proxy/config"
 )
 
 type Model struct {
@@ -33,8 +35,7 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/version", pm.apiGetVersion)
-		apiGroup.GET("/config/current", pm.apiGetCurrentConfig)
-		apiGroup.GET("/config/example", pm.apiGetExampleConfig)
+		apiGroup.GET("/config", pm.apiGetConfig)
 		apiGroup.POST("/config", pm.apiUpdateConfig)
 	}
 }
@@ -176,7 +177,10 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 		sendModels()
 	})()
 	defer event.On(func(e ConfigFileChangedEvent) {
-		sendModels()
+		// Only send models after the config has been reloaded
+		if e.ReloadingState == ReloadingStateEnd {
+			sendModels()
+		}
 	})()
 
 	/**
@@ -256,33 +260,27 @@ func (pm *ProxyManager) apiGetVersion(c *gin.Context) {
 	})
 }
 
-func (pm *ProxyManager) apiGetCurrentConfig(c *gin.Context) {
+func (pm *ProxyManager) apiGetConfig(c *gin.Context) {
 	pm.Lock()
 	configPath := pm.configPath
 	pm.Unlock()
 
 	if configPath == "" {
-		pm.sendErrorResponse(c, http.StatusNotFound, "Config file path not set")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config path not set"})
 		return
 	}
 
-	data, err := os.ReadFile(configPath)
+	// Read the config file
+	content, err := os.ReadFile(configPath)
 	if err != nil {
-		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to read config file: %v", err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read config file: %v", err)})
 		return
 	}
 
-	c.Data(http.StatusOK, "text/yaml; charset=utf-8", data)
-}
-
-func (pm *ProxyManager) apiGetExampleConfig(c *gin.Context) {
-	data, err := os.ReadFile("config.example.yaml")
-	if err != nil {
-		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to read example config: %v", err))
-		return
-	}
-
-	c.Data(http.StatusOK, "text/yaml; charset=utf-8", data)
+	c.JSON(http.StatusOK, gin.H{
+		"path":    configPath,
+		"content": string(content),
+	})
 }
 
 func (pm *ProxyManager) apiUpdateConfig(c *gin.Context) {
@@ -291,26 +289,46 @@ func (pm *ProxyManager) apiUpdateConfig(c *gin.Context) {
 	pm.Unlock()
 
 	if configPath == "" {
-		pm.sendErrorResponse(c, http.StatusBadRequest, "Config file path not set")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config path not set"})
 		return
 	}
 
-	body, err := io.ReadAll(c.Request.Body)
+	var req struct {
+		Content string `json:"content" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	// Validate YAML syntax by attempting to load it
+	_, err := config.LoadConfigFromReader(strings.NewReader(req.Content))
 	if err != nil {
-		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid YAML configuration: %v", err)})
 		return
 	}
 
-	// Write to config file
-	if err := os.WriteFile(configPath, body, 0644); err != nil {
-		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("Failed to write config file: %v", err))
+	// Get the absolute path of the original config to prevent path traversal
+	absConfigPath, err := filepath.Abs(configPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve config path"})
 		return
 	}
 
-	// Trigger config reload event
+	// Write to the config file
+	err = os.WriteFile(absConfigPath, []byte(req.Content), 0644)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to write config file: %v", err)})
+		return
+	}
+
+	// Emit config file changed event to trigger reload
 	event.Emit(ConfigFileChangedEvent{
 		ReloadingState: ReloadingStateStart,
 	})
 
-	c.JSON(http.StatusOK, gin.H{"message": "Config updated successfully. Reloading..."})
+	c.JSON(http.StatusOK, gin.H{
+		"message": "config updated successfully, reloading...",
+	})
 }

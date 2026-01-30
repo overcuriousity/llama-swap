@@ -15,8 +15,8 @@
   let cliArgsSearch = $state("");
   let copiedArg = $state("");
 
-  let editorContainer: HTMLDivElement;
-  let exampleEditorContainer: HTMLDivElement;
+  let editorContainer = $state<HTMLDivElement>();
+  let exampleEditorContainer = $state<HTMLDivElement>();
   let editor: any;
   let exampleEditor: any;
 
@@ -180,6 +180,13 @@
 
     // Wait for Svelte to update the DOM
     await tick();
+
+    // Ensure containers exist before proceeding
+    if (!editorContainer || !exampleEditorContainer) {
+      console.error('Editor containers not found after tick()');
+      error = 'Failed to load code editor. Using fallback.';
+      return;
+    }
 
     // Dynamically import Monaco editor
     try {

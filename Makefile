@@ -35,8 +35,9 @@ test: proxy/ui_dist/placeholder.txt
 test-all: proxy/ui_dist/placeholder.txt
 	go test -race -count=1 ./proxy/...
 
-ui-svelte/node_modules:
+ui-svelte/node_modules: ui-svelte/package.json ui-svelte/package-lock.json
 	cd ui-svelte && npm install
+	touch ui-svelte/node_modules
 
 # build svelte UI
 ui: ui-svelte/node_modules

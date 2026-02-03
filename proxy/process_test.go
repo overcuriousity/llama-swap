@@ -592,7 +592,7 @@ func TestProcess_StopCommandDoesNotHangWhenStartFails(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("fail-test", 1, config, debugLogger, debugLogger)
+	process := NewProcess("fail-test", 1, config, debugLogger, debugLogger, context.Background())
 
 	// Try to start the process - this will fail
 	err := process.start()
@@ -632,7 +632,7 @@ func TestProcess_StopImmediatelyDuringStartup(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("interrupt-test", 20, config, debugLogger, debugLogger)
+	process := NewProcess("interrupt-test", 20, config, debugLogger, debugLogger, context.Background())
 	process.healthCheckLoopInterval = 100 * time.Millisecond
 
 	// Start the process in a goroutine (it will be in StateStarting)

@@ -6,6 +6,7 @@
   import Models from "./routes/Models.svelte";
   import Activity from "./routes/Activity.svelte";
   import Playground from "./routes/Playground.svelte";
+  import Config from "./routes/Config.svelte";
   import { enableAPIEvents } from "./stores/api";
   import { initScreenWidth, isDarkMode, appTitle, connectionState } from "./stores/theme";
 
@@ -14,6 +15,7 @@
     "/models": Models,
     "/logs": LogViewer,
     "/activity": Activity,
+    "/config": Config,
     "*": Playground,
   };
 

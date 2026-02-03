@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func TestProcess_AutomaticallyStartsUpstream(t *testing.T) {
 	config := getTestSimpleResponderConfig(expectedMessage)
 
 	// Create a process
-	process := NewProcess("test-process", 5, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", 5, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	req := httptest.NewRequest("GET", "/test", nil)
@@ -78,7 +79,7 @@ func TestProcess_WaitOnMultipleStarts(t *testing.T) {
 	expectedMessage := "testing91931"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("test-process", 5, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", 5, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	var wg sync.WaitGroup
@@ -106,7 +107,7 @@ func TestProcess_BrokenModelConfig(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("broken", 1, config, debugLogger, debugLogger)
+	process := NewProcess("broken", 1, config, debugLogger, debugLogger, context.Background())
 
 	req := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -131,7 +132,7 @@ func TestProcess_UnloadAfterTTL(t *testing.T) {
 	config.UnloadAfter = 3 // seconds
 	assert.Equal(t, 3, config.UnloadAfter)
 
-	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	// this should take 4 seconds
@@ -173,7 +174,7 @@ func TestProcess_LowTTLValue(t *testing.T) {
 	config.UnloadAfter = 1 // second
 	assert.Equal(t, 1, config.UnloadAfter)
 
-	process := NewProcess("ttl", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl", 2, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	for i := 0; i < 100; i++ {
@@ -200,7 +201,7 @@ func TestProcess_HTTPRequestsHaveTimeToFinish(t *testing.T) {
 
 	expectedMessage := "12345"
 	config := getTestSimpleResponderConfig(expectedMessage)
-	process := NewProcess("t", 10, config, debugLogger, debugLogger)
+	process := NewProcess("t", 10, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	results := map[string]string{
@@ -273,7 +274,7 @@ func TestProcess_SwapState(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			p := NewProcess("test", 10, getTestSimpleResponderConfig("test"), debugLogger, debugLogger)
+			p := NewProcess("test", 10, getTestSimpleResponderConfig("test"), debugLogger, debugLogger, context.Background())
 			p.state = test.currentState
 
 			resultState, err := p.swapState(test.expectedState, test.newState)
@@ -306,7 +307,7 @@ func TestProcess_ShutdownInterruptsHealthCheck(t *testing.T) {
 	config.Proxy = "http://localhost:9998/test"
 
 	healthCheckTTLSeconds := 30
-	process := NewProcess("test-process", healthCheckTTLSeconds, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", healthCheckTTLSeconds, config, debugLogger, debugLogger, context.Background())
 
 	// make it a lot faster
 	process.healthCheckLoopInterval = time.Second
@@ -341,7 +342,7 @@ func TestProcess_ExitInterruptsHealthCheck(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("sleepy", checkHealthTimeout, config, debugLogger, debugLogger)
+	process := NewProcess("sleepy", checkHealthTimeout, config, debugLogger, debugLogger, context.Background())
 	process.healthCheckLoopInterval = time.Second // make it faster
 	err := process.start()
 	assert.Equal(t, "upstream command exited prematurely but successfully", err.Error())
@@ -359,7 +360,7 @@ func TestProcess_ConcurrencyLimit(t *testing.T) {
 	// only allow 1 concurrent request at a time
 	config.ConcurrencyLimit = 1
 
-	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger, context.Background())
 	assert.Equal(t, 1, cap(process.concurrencyLimitSemaphore))
 	defer process.Stop()
 
@@ -384,7 +385,7 @@ func TestProcess_StopImmediately(t *testing.T) {
 	expectedMessage := "test_stop_immediate"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("stop_immediate", 2, config, debugLogger, debugLogger)
+	process := NewProcess("stop_immediate", 2, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	err := process.start()
@@ -424,7 +425,7 @@ func TestProcess_ForceStopWithKill(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("stop_immediate", 2, conf, debugLogger, debugLogger)
+	process := NewProcess("stop_immediate", 2, conf, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	// reduce to make testing go faster
@@ -474,7 +475,7 @@ func TestProcess_StopCmd(t *testing.T) {
 		conf.CmdStop = "kill -TERM ${PID}"
 	}
 
-	process := NewProcess("testStopCmd", 2, conf, debugLogger, debugLogger)
+	process := NewProcess("testStopCmd", 2, conf, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	err := process.start()
@@ -494,8 +495,8 @@ func TestProcess_EnvironmentSetCorrectly(t *testing.T) {
 	// ensure the additiona variables are appended to the process' environment
 	configWEnv.Env = append(configWEnv.Env, "TEST_ENV1=1", "TEST_ENV2=2")
 
-	process1 := NewProcess("env_test", 2, conf, debugLogger, debugLogger)
-	process2 := NewProcess("env_test", 2, configWEnv, debugLogger, debugLogger)
+	process1 := NewProcess("env_test", 2, conf, debugLogger, debugLogger, context.Background())
+	process2 := NewProcess("env_test", 2, configWEnv, debugLogger, debugLogger, context.Background())
 
 	process1.start()
 	defer process1.Stop()
@@ -530,7 +531,7 @@ func TestProcess_ReverseProxyPanicIsHandled(t *testing.T) {
 	expectedMessage := "panic_test"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("panic-test", 5, config, debugLogger, debugLogger)
+	process := NewProcess("panic-test", 5, config, debugLogger, debugLogger, context.Background())
 	defer process.Stop()
 
 	// Start the process

@@ -2,224 +2,428 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/server"
+	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/watcher"
 )
 
 var (
-	version string = "0"
-	commit  string = "abcd1234"
-	date    string = "unknown"
+	version = "0"
+	commit  = "abcd1234"
+	date    = "unknown"
 )
 
+const shutdownTimeout = 30 * time.Second
+
+// debounce coalesces bursts of calls into a single invocation of fn, delay
+// after the last call. A config write through the UI editor is seen twice --
+// once via the editor's own event, once via the file watcher -- and each
+// reload rebuilds the whole server, so the duplicate is worth collapsing.
+func debounce(delay time.Duration, fn func()) func() {
+	var mu sync.Mutex
+	var timer *time.Timer
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(delay, fn)
+	}
+}
+
+// logTimeFormats maps the cfg.LogTimeFormat value to a Go time layout. An
+// unset or unrecognised value yields "" — no timestamp prefix.
+var logTimeFormats = map[string]string{
+	"ansic":       time.ANSIC,
+	"unixdate":    time.UnixDate,
+	"rubydate":    time.RubyDate,
+	"rfc822":      time.RFC822,
+	"rfc822z":     time.RFC822Z,
+	"rfc850":      time.RFC850,
+	"rfc1123":     time.RFC1123,
+	"rfc1123z":    time.RFC1123Z,
+	"rfc3339":     time.RFC3339,
+	"rfc3339nano": time.RFC3339Nano,
+	"kitchen":     time.Kitchen,
+	"stamp":       time.Stamp,
+	"stampmilli":  time.StampMilli,
+	"stampmicro":  time.StampMicro,
+	"stampnano":   time.StampNano,
+}
+
+func configStorePath(cfg config.Config) string {
+	if cfg.Store == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Store.Path)
+}
+
 func main() {
-	// Define a command-line flag for the port
-	configPath := flag.String("config", "config.yaml", "config file name")
-	listenStr := flag.String("listen", "", "listen ip/port")
-	certFile := flag.String("tls-cert-file", "", "TLS certificate file")
-	keyFile := flag.String("tls-key-file", "", "TLS key file")
-	showVersion := flag.Bool("version", false, "show version of build")
-	watchConfig := flag.Bool("watch-config", false, "Automatically reload config file on change")
+	flagConfig := flag.String("config", "", "path to config file")
+	flagConfigDir := flag.String("config-dir", "", "directory of *.yml/*.yaml config files (additive to -config)")
+	flagListen := flag.String("listen", "", "listen address (default :8080 or :8443 for TLS)")
+	flagCertFile := flag.String("tls-cert-file", "", "TLS certificate file")
+	flagKeyFile := flag.String("tls-key-file", "", "TLS key file")
+	flagVersion := flag.Bool("version", false, "show version and exit")
+	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
+	flag.Parse()
 
-	flag.Parse() // Parse the command-line flags
-
-	if *showVersion {
+	if *flagVersion {
 		fmt.Printf("version: %s (%s), built at %s\n", version, commit, date)
 		os.Exit(0)
 	}
 
-	conf, err := config.LoadConfig(*configPath)
-	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
+	if *flagConfig == "" && *flagConfigDir == "" {
+		slog.Error("at least one of -config or -config-dir must be provided")
 		os.Exit(1)
 	}
 
-	if len(conf.Profiles) > 0 {
-		fmt.Println("WARNING: Profile functionality has been removed in favor of Groups. See the README for more information.")
-	}
-
-	if mode := os.Getenv("GIN_MODE"); mode != "" {
-		gin.SetMode(mode)
-	} else {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	// Validate TLS flags.
-	var useTLS = (*certFile != "" && *keyFile != "")
-	if (*certFile != "" && *keyFile == "") ||
-		(*certFile == "" && *keyFile != "") {
-		fmt.Println("Error: Both --tls-cert-file and --tls-key-file must be provided for TLS.")
+	useTLS := *flagCertFile != "" || *flagKeyFile != ""
+	if (*flagCertFile != "" && *flagKeyFile == "") || (*flagCertFile == "" && *flagKeyFile != "") {
+		slog.Error("both -tls-cert-file and -tls-key-file must be provided for TLS")
 		os.Exit(1)
 	}
 
-	// Set default ports.
-	if *listenStr == "" {
-		defaultPort := ":8080"
+	listenAddr := *flagListen
+	if listenAddr == "" {
 		if useTLS {
-			defaultPort = ":8443"
+			listenAddr = ":8443"
+		} else {
+			listenAddr = ":8080"
 		}
-		listenStr = &defaultPort
 	}
 
-	// Setup channels for server management
-	exitChan := make(chan struct{})
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Create server with initial handler
-	srv := &http.Server{
-		Addr: *listenStr,
+	cfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
+	if err != nil {
+		slog.Error("failed to load config", "config", *flagConfig, "config-dir", *flagConfigDir, "error", err)
+		os.Exit(1)
 	}
 
-	// Support for watching config and reloading when it changes
-	reloadProxyManager := func() {
-		if currentPM, ok := srv.Handler.(*proxy.ProxyManager); ok {
-			conf, err = config.LoadConfig(*configPath)
+	// Loggers are wired per cfg.LogToStdout: proxy/upstream feed muxLog, which
+	// owns the combined history served by /logs. They outlive config reloads,
+	// so a LogToStdout change requires a restart to take effect.
+	muxLog, proxyLog, upstreamLog := server.NewLoggers(cfg.LogToStdout)
+
+	applyLogSettings := func(cfg config.Config) {
+		level := logmon.LevelInfo
+		switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
+		case "debug":
+			level = logmon.LevelDebug
+		case "warn":
+			level = logmon.LevelWarn
+		case "error":
+			level = logmon.LevelError
+		}
+		timeFormat := logTimeFormats[strings.ToLower(strings.TrimSpace(cfg.LogTimeFormat))]
+		for _, lg := range []*logmon.Monitor{proxyLog, upstreamLog} {
+			lg.SetLogLevel(level)
+			lg.SetLogTimeFormat(timeFormat)
+		}
+	}
+
+	applyLogSettings(cfg)
+	proxyLog.Debugf("PID: %d", os.Getpid())
+
+	// On Windows, bind the process tree to a Job Object so every upstream
+	// process is reaped when llama-swap exits — even on a forced kill. No-op
+	// elsewhere. Non-fatal: a failure just falls back to per-process teardown.
+	if err := process.SetupTreeCleanup(); err != nil {
+		proxyLog.Warnf("failed to set up process tree cleanup: %v", err)
+	}
+
+	// perfMon outlives config reloads; its config is updated in place.
+	var perfMon *perf.Monitor
+	if !cfg.Performance.Disabled {
+		perfMon, err = perf.New(cfg.Performance, proxyLog)
+		if err != nil {
+			slog.Error("failed to create performance monitor", "error", err)
+			os.Exit(1)
+		}
+		perfMon.Start()
+	} else {
+		proxyLog.Info("performance monitoring is disabled")
+	}
+
+	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
+
+	initialStorePath := configStorePath(cfg)
+	initialStore, err := store.New(initialStorePath)
+	if err != nil {
+		slog.Error("failed to create store", "error", err)
+		os.Exit(1)
+	}
+
+	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, initialStore, buildInfo)
+	if err != nil {
+		slog.Error("failed to create server", "error", err)
+		initialStore.Close()
+		os.Exit(1)
+	}
+
+	// configSource enables the UI config editor. It stays empty when started
+	// without a config file, which leaves the editor endpoints disabled.
+	configSource := server.ConfigSource{Example: GetConfigExampleYAML()}
+	if *flagConfig != "" {
+		configSource.Path = *flagConfig
+	}
+	initialSrv.SetConfigSource(configSource)
+
+	// activeSrv is swapped atomically during hot reload.
+	var activeMu sync.RWMutex
+	activeSrv := initialSrv
+	activeStore := initialStore
+	activeStorePath := initialStorePath
+
+	httpServer := &http.Server{
+		Addr: listenAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			activeMu.RLock()
+			srv := activeSrv
+			activeMu.RUnlock()
+			srv.ServeHTTP(w, r)
+		}),
+	}
+
+	// reload guards against overlapping reloads triggered by concurrent signals
+	// or file-watcher callbacks.
+	var reloading bool
+	var reloadMu sync.Mutex
+
+	reload := func() {
+		reloadMu.Lock()
+		if reloading {
+			reloadMu.Unlock()
+			return
+		}
+		reloading = true
+		reloadMu.Unlock()
+		defer func() {
+			reloadMu.Lock()
+			reloading = false
+			reloadMu.Unlock()
+		}()
+
+		proxyLog.Info("reloading configuration")
+
+		newCfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
+		if err != nil {
+			proxyLog.Warnf("failed to reload config: %v", err)
+			return
+		}
+
+		if perfMon != nil {
+			perfMon.UpdateConfig(newCfg.Performance)
+		}
+
+		newStorePath := configStorePath(newCfg)
+		activeMu.RLock()
+		currentStore := activeStore
+		currentStorePath := activeStorePath
+		activeMu.RUnlock()
+
+		newStore := currentStore
+		storeChanged := newStorePath != currentStorePath
+		if storeChanged {
+			newStore, err = store.New(newStorePath)
 			if err != nil {
-				fmt.Printf("Warning, unable to reload configuration: %v\n", err)
+				proxyLog.Warnf("failed to create new store during reload: %v", err)
 				return
 			}
-
-			fmt.Println("Configuration Changed")
-			currentPM.Shutdown()
-			newPM := proxy.New(conf)
-			newPM.SetVersion(date, commit, version)
-			newPM.SetConfigPath(*configPath)
-			newPM.SetConfigExample(GetConfigExampleYAML())
-			srv.Handler = newPM
-			fmt.Println("Configuration Reloaded")
-
-			// wait a few seconds and tell any UI to reload
-			time.AfterFunc(3*time.Second, func() {
-				event.Emit(proxy.ConfigFileChangedEvent{
-					ReloadingState: proxy.ReloadingStateEnd,
-				})
-			})
-		} else {
-			conf, err = config.LoadConfig(*configPath)
-			if err != nil {
-				fmt.Printf("Error, unable to load configuration: %v\n", err)
-				os.Exit(1)
-			}
-			newPM := proxy.New(conf)
-			newPM.SetVersion(date, commit, version)
-			newPM.SetConfigPath(*configPath)
-			newPM.SetConfigExample(GetConfigExampleYAML())
-			srv.Handler = newPM
 		}
+
+		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo)
+		if err != nil {
+			proxyLog.Warnf("failed to build new server during reload: %v", err)
+			if storeChanged {
+				newStore.Close()
+			}
+			return
+		}
+		newSrv.SetConfigSource(configSource)
+
+		activeMu.Lock()
+		old := activeSrv
+		oldStore := activeStore
+		activeSrv = newSrv
+		activeStore = newStore
+		activeStorePath = newStorePath
+		activeMu.Unlock()
+
+		applyLogSettings(newCfg)
+
+		if err := old.Shutdown(shutdownTimeout); err != nil {
+			proxyLog.Warnf("error shutting down old server during reload: %v", err)
+		}
+		if storeChanged {
+			if err := oldStore.Close(); err != nil {
+				proxyLog.Warnf("error closing old store during reload: %v", err)
+			}
+		}
+
+		// Notify UI after a short delay so it can refresh model state.
+		time.AfterFunc(3*time.Second, func() {
+			event.Emit(shared.ConfigFileChangedEvent{State: shared.ReloadingStateEnd})
+		})
+
+		proxyLog.Info("configuration reloaded")
 	}
 
-	// load the initial proxy manager
-	reloadProxyManager()
-	debouncedReload := debounce(time.Second, reloadProxyManager)
+	debouncedReload := debounce(time.Second, reload)
 
-	// Always listen for API-triggered config changes
-	defer event.On(func(e proxy.ConfigFileChangedEvent) {
-		if e.ReloadingState == proxy.ReloadingStateStart {
+	// Reload on config written through the UI editor, independent of
+	// --watch-config: the editor's own POST is the change signal.
+	defer event.On(func(e shared.ConfigFileChangedEvent) {
+		if e.State == shared.ReloadingStateStart {
 			debouncedReload()
 		}
 	})()
 
-	if *watchConfig {
-		fmt.Println("Watching Configuration for changes")
-		go func() {
-			absConfigPath, err := filepath.Abs(*configPath)
-			if err != nil {
-				fmt.Printf("Error getting absolute path for watching config file: %v\n", err)
-				return
-			}
-			watcher, err := fsnotify.NewWatcher()
-			if err != nil {
-				fmt.Printf("Error creating file watcher: %v. File watching disabled.\n", err)
-				return
-			}
+	watcherCtx, watcherCancel := context.WithCancel(context.Background())
+	defer watcherCancel()
 
-			configDir := filepath.Dir(absConfigPath)
-			err = watcher.Add(configDir)
+	if *flagWatchConfig {
+		proxyLog.Info("watching configuration for changes (poll-based, 2s interval)")
+
+		if *flagConfig != "" {
+			absConfigPath, err := filepath.Abs(*flagConfig)
 			if err != nil {
-				fmt.Printf("Error adding config path directory (%s) to watcher: %v. File watching disabled.", configDir, err)
-				return
+				slog.Error("watch-config: failed to resolve config path", "error", err)
+				os.Exit(1)
 			}
+			go func() {
+				(&configwatcher.Watcher{
+					Path:     absConfigPath,
+					Interval: configwatcher.DefaultInterval,
+					OnChange: debouncedReload,
+				}).Run(watcherCtx)
+			}()
+		}
 
-			defer watcher.Close()
-			for {
-				select {
-				case changeEvent := <-watcher.Events:
-					if changeEvent.Name == absConfigPath && (changeEvent.Has(fsnotify.Write) || changeEvent.Has(fsnotify.Create) || changeEvent.Has(fsnotify.Remove)) {
-						event.Emit(proxy.ConfigFileChangedEvent{
-							ReloadingState: proxy.ReloadingStateStart,
-						})
-					} else if changeEvent.Name == filepath.Join(configDir, "..data") && changeEvent.Has(fsnotify.Create) {
-						// the change for k8s configmap
-						event.Emit(proxy.ConfigFileChangedEvent{
-							ReloadingState: proxy.ReloadingStateStart,
-						})
-					}
-
-				case err := <-watcher.Errors:
-					log.Printf("File watcher error: %v", err)
-				}
+		if *flagConfigDir != "" {
+			absConfigDir, err := filepath.Abs(*flagConfigDir)
+			if err != nil {
+				slog.Error("watch-config: failed to resolve config-dir path", "error", err)
+				os.Exit(1)
 			}
-		}()
+			go func() {
+				(&configwatcher.DirWatcher{
+					Path:     absConfigDir,
+					Interval: configwatcher.DefaultInterval,
+					OnChange: debouncedReload,
+				}).Run(watcherCtx)
+			}()
+		}
 	}
 
-	// shutdown on signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
 	go func() {
-		sig := <-sigChan
-		fmt.Printf("Received signal %v, shutting down...\n", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		defer cancel()
-
-		if pm, ok := srv.Handler.(*proxy.ProxyManager); ok {
-			pm.Shutdown()
-		} else {
-			fmt.Println("srv.Handler is not of type *proxy.ProxyManager")
-		}
-
-		if err := srv.Shutdown(ctx); err != nil {
-			fmt.Printf("Server shutdown error: %v\n", err)
-		}
-		close(exitChan)
-	}()
-
-	// Start server
-	go func() {
-		var err error
+		var startErr error
 		if useTLS {
-			fmt.Printf("llama-swap listening with TLS on https://%s\n", *listenStr)
-			err = srv.ListenAndServeTLS(*certFile, *keyFile)
+			proxyLog.Infof("llama-swap listening with TLS on https://%s", listenAddr)
+			startErr = httpServer.ListenAndServeTLS(*flagCertFile, *flagKeyFile)
 		} else {
-			fmt.Printf("llama-swap listening on http://%s\n", *listenStr)
-			err = srv.ListenAndServe()
+			proxyLog.Infof("llama-swap listening on http://%s", listenAddr)
+			startErr = httpServer.ListenAndServe()
 		}
-		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Fatal server error: %v\n", err)
+		if startErr != nil && !errors.Is(startErr, http.ErrServerClosed) {
+			slog.Error("http server error", "error", startErr)
+			os.Exit(1)
 		}
 	}()
 
-	// Wait for exit signal
-	<-exitChan
-}
-
-func debounce(interval time.Duration, f func()) func() {
-	var timer *time.Timer
-	return func() {
-		if timer != nil {
-			timer.Stop()
-		}
-		timer = time.AfterFunc(interval, f)
+	if !shared.IsLoopbackAddr(listenAddr) {
+		_, port, _ := net.SplitHostPort(listenAddr)
+		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
 	}
+
+	exitChan := make(chan struct{})
+
+	go func() {
+		for {
+			sig := <-sigChan
+			switch sig {
+			case syscall.SIGHUP:
+				proxyLog.Info("received SIGHUP, reloading config")
+				go reload()
+			case syscall.SIGINT, syscall.SIGTERM:
+				proxyLog.Infof("received signal %v, shutting down", sig)
+				watcherCancel()
+
+				// Backstop against a stalled shutdown: force the process to
+				// exit once the whole graceful sequence has had its full budget.
+				// On Windows the Job Object reaps upstream processes on exit, so
+				// a forced exit still cleans up rather than orphaning children.
+				go func() {
+					time.Sleep(shutdownTimeout + 5*time.Second)
+					proxyLog.Warnf("graceful shutdown exceeded %v, forcing exit", shutdownTimeout)
+					os.Exit(1)
+				}()
+
+				activeMu.RLock()
+				srv := activeSrv
+				st := activeStore
+				activeMu.RUnlock()
+
+				// Close long-lived SSE streams first so httpServer.Shutdown can
+				// drain without blocking on them for the full timeout.
+				srv.CloseStreams()
+
+				// Both phases share a single deadline so total shutdown is
+				// bounded by shutdownTimeout rather than 2x it.
+				deadline := time.Now().Add(shutdownTimeout)
+				shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
+				defer cancel()
+				if err := httpServer.Shutdown(shutdownCtx); err != nil {
+					proxyLog.Warnf("http server shutdown error: %v", err)
+				}
+
+				// Clamp the remaining budget to a small positive value: a
+				// non-positive timeout makes the router fall back to its own
+				// healthCheckTimeout, which would defeat the shared deadline.
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					remaining = time.Millisecond
+				}
+				if err := srv.Shutdown(remaining); err != nil {
+					proxyLog.Warnf("router shutdown error: %v", err)
+				}
+
+				if perfMon != nil {
+					perfMon.Stop()
+				}
+				if err := st.Close(); err != nil {
+					proxyLog.Warnf("store shutdown error: %v", err)
+				}
+
+				close(exitChan)
+				return
+			}
+		}
+	}()
+
+	<-exitChan
+	proxyLog.Info("shutdown complete")
 }

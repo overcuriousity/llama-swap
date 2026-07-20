@@ -5,29 +5,30 @@ llama-swap is a light weight, transparent proxy server that provides automatic m
 ## Tech stack
 
 - golang
-- typescript, vite and svelt5 for UI (located in ui/)
+- typescript, vite and svelte 5 for UI (located in ui-svelte/)
 
 ## Workflow Tasks
 
 - when summarizing changes only include details that require further action
-- just say "Done." when there is no further action
-- use the github CLI `gh` to create pull requests and work with github
 - Rules for creating pull requests:
-  - keep them short and focused on changes.
-  - never include a test plan
+  - keep them short and focused on changes
+  - skip the test plan
   - write the summary using the same style rules as commit message
 
 ## Testing
 
 - Follow test naming conventions like `TestProxyManager_<test name>`, `TestProcessGroup_<test name>`, etc.
 - Use `go test -v -run <name pattern for new tests>` to run any new tests you've written.
+- Run `gofmt -w <file>` before committing to fix any formatting
+- Build go binaries into the ./build/ subdirectory
 - Use `make test-dev` after running new tests for a quick over all test run. This runs `go test` and `staticcheck`. Fix any static checking errors. Use this only when changes are made to any code under the `proxy/` directory
 - Use `make test-all` before completing work. This includes long running concurrency tests.
+- Use `make test-ui` after making changes to the UI in ui-svelte/
 
 ### Commit message example format:
 
 ```
-proxy: add new feature
+internal/server: add new feature
 
 Add new feature that implements functionality X and Y.
 

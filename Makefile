@@ -2,6 +2,8 @@
 APP_NAME = llama-swap
 BUILD_DIR = build
 
+# Get closest tag or if that fails (no git repo or no tags) then devel
+GIT_VERSION := $(shell git describe --abbrev=6 --tags 2>/dev/null || echo devel)
 # Get the current Git hash
 GIT_HASH := $(shell git rev-parse --short HEAD)
 ifneq ($(shell git status --porcelain),)
@@ -19,47 +21,49 @@ all: mac linux simple-responder
 clean:
 	rm -rf $(BUILD_DIR)
 
-proxy/ui_dist/placeholder.txt:
-	mkdir -p proxy/ui_dist
-	touch $@
-
 # use cached test results while developing
-test-dev: proxy/ui_dist/placeholder.txt
-	go test -short ./proxy/...
-	staticcheck ./proxy/... || true
+test-dev:
+	go test -short ./...
+	staticcheck ./... || true
 
-test: proxy/ui_dist/placeholder.txt
-	go test -short -count=1 ./proxy/...
+test:
+	go test -short -count=1 ./internal/...
 
 # for CI - full test (takes longer)
-test-all: proxy/ui_dist/placeholder.txt
-	go test -race -count=1 ./proxy/...
+test-all:
+	go test -race -count=1 ./internal/...
 
 ui-svelte/node_modules: ui-svelte/package.json ui-svelte/package-lock.json
 	cd ui-svelte && npm install
 	touch ui-svelte/node_modules
 
-# build svelte UI
+# build svelte UI into internal/server/ui_dist; the `embed_ui` build tag embeds
+# this output into the binary (see internal/server/embed.go)
 ui: ui-svelte/node_modules
 	cd ui-svelte && npm run build
 
 # Build OSX binary
 mac: ui
 	@echo "Building Mac binary..."
-	GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
+	GOOS=darwin GOARCH=arm64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
 
 # Build Linux binary
-linux: ui
-	@echo "Building Linux binary..."
-	GOOS=linux GOARCH=amd64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64
-	GOOS=linux GOARCH=arm64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-arm64
+linux: linux-arm64 linux-amd64
+
+linux-amd64: ui
+	@echo "Building Linux AMD64 binary..."
+	GOOS=linux GOARCH=amd64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64
+
+linux-arm64: ui
+	@echo "Building Linux ARM64 binary..."
+	GOOS=linux GOARCH=arm64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-arm64
 
 # Build Windows binary
 windows: ui
 	@echo "Building Windows binary..."
-	GOOS=windows GOARCH=amd64 go build -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-windows-amd64.exe
+	GOOS=windows GOARCH=amd64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-windows-amd64.exe
 
-# for testing proxy.Process
+# for testing with real external processes
 simple-responder:
 	@echo "Building simple responder"
 	GOOS=darwin GOARCH=arm64 go build -o $(BUILD_DIR)/simple-responder_darwin_arm64 cmd/simple-responder/simple-responder.go
@@ -93,5 +97,9 @@ wol-proxy: $(BUILD_DIR)
 	@echo "Building wol-proxy"
 	go build -o $(BUILD_DIR)/wol-proxy-$(GOOS)-$(GOARCH)-$(shell date +%Y-%m-%d) cmd/wol-proxy/wol-proxy.go
 
+test-ui:
+	cd ui-svelte && npm ci && npm run check && npm test
+
 # Phony targets
-.PHONY: all clean ui mac linux windows simple-responder simple-responder-windows test test-all test-dev wol-proxy
+.PHONY: all clean ui mac windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
+.PHONE: linux linux-arm64 linux-amd64

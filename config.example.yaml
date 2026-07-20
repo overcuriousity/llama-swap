@@ -44,16 +44,45 @@ logTimeFormat: ""
 #   - "none": no logs are ever written to stdout
 logToStdout: "proxy"
 
+# store: persistent storage for activity metrics state
+# - optional, default: in-memory sqlite database capped by metricsMaxInMemory
+# - path is a sqlite database file path
+# - file-backed sqlite keeps activity logs across restarts
+# store:
+#   path: /path/to/file.sqlite
+
 # metricsMaxInMemory: maximum number of metrics to keep in memory
 # - optional, default: 1000
 # - controls how many metrics are stored in memory before older ones are discarded
 # - useful for limiting memory usage when processing large volumes of metrics
+# - when persistent sqlite storage is defined in store.path this has no effect
 metricsMaxInMemory: 1000
 
 # captureBuffer: how many MBs to allocate for storing request/response captures
 # - optional, default: 10
 # - set to 0 to disable
 captureBuffer: 15
+
+# ui.activity.session_id: ordered request headers used to identify sessions in
+# the Activity page's in-flight request table.
+# - optional, default: ["X-Session-ID", "X-Litellm-Session-Id"]
+# - matching is case-insensitive; the first non-empty matching header is shown
+# - set to [] to disable session ID lookup
+ui:
+  activity:
+    session_id: ["X-Session-ID", "X-Litellm-Session-Id"]
+
+# performance: configuration for system monitoring statistics
+# - timing values are duration strings like 1s, 1h30m, 90m, 2h10s, etc.
+performance:
+  # disabled: boolean
+  # - default: false
+  disabled: false
+
+  # every: delay between polling for new performance statistics
+  # - default: 5s
+  # - minimum duration 5s
+  every: 15s
 
 # startPort: sets the starting port number for the automatic ${PORT} macro.
 # - optional, default: 5800
@@ -80,6 +109,13 @@ includeAliasesInList: false
 # - must be >= 0
 globalTTL: 0
 
+# unloadTimeout: graceful timeout in seconds when unloading a model (manual, API, or ttl expiry)
+# - optional, default: 10
+# - used before force-killing the model process on unload
+# - can be overridden per model with model.unloadTimeout
+# - large values extend how long an unload can take when a process does not exit cleanly
+unloadTimeout: 10
+
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary
 # - macros are reusable snippets
@@ -96,8 +132,7 @@ globalTTL: 0
 macros:
   # Example of a multi-line macro
   "latest-llama": >
-    /path/to/llama-server/llama-server-ec9e0301
-    --port ${PORT}
+    /path/to/llama-server/llama-server-ec9e0301 --port ${PORT}
 
   "default_ctx": 4096
 
@@ -122,6 +157,33 @@ apiKeys:
   # use environment variable macros to keep secrets out of the config
   - "${env.API_KEY_1}"
   - "${env.API_KEY_2}"
+
+# upstream: controls behaviour of the /upstream passthrough endpoint
+# - optional, default: empty dictionary
+# - recommended to only use in special use cases. Leaving it as the
+#   default will typically be the best experience
+upstream:
+  # ignorePaths: list of RE2 compatible regular expressions
+  # - default: (see below)
+  # - any request to a path matching any of the regular expressions
+  #   will be ignored and not trigger a swap
+  ignorePaths:
+    - '.*\.(js|json|css|png|gif|jpg|jpeg|ico|txt)$'
+
+# profiles: named model ID replacements switched at runtime through the UI or API
+# - optional, default: empty dictionary
+# - one profile or none is active; startup and configuration reload select none
+# - pins are applied before aliases, filters, and routing
+# - targets may be a local model, peer model, alias, or setParamsByID alias
+# - an empty string or YAML null (~) disables the pin with a 404; it is not
+#   added to model listings, while existing local, alias, or peer IDs remain
+profiles:
+  "coding":
+    description: "Coding-focused model routing"
+    pins:
+      "llm-code": "gpt-oss-120b"
+      "llm-plan": "qwen-unlisted"
+      "image-gen": ~
 
 # models: a dictionary of model configurations
 # - required
@@ -192,6 +254,12 @@ models:
     # - a value of 0 disables automatic unloading of the model
     ttl: 60
 
+    # unloadTimeout: graceful timeout in seconds when unloading this model (manual, API, or ttl expiry)
+    # - optional, default: global unloadTimeout
+    # - a value of 0 uses the global unloadTimeout
+    # - useful for slow cmdStop commands such as docker stop
+    unloadTimeout: 10
+
     # useModelName: override the model name that is sent to upstream server
     # - optional, default: ""
     # - useful for when the upstream server expects a specific model name that
@@ -257,7 +325,8 @@ models:
 
       # the ${temp} macro will remain a float
       temperature: ${temp}
-      note: "The ${MODEL_ID} is running on port ${PORT} temp=${temp}, context=${default_ctx}"
+      note: "The ${MODEL_ID} is running on port ${PORT} temp=${temp},
+        context=${default_ctx}"
 
       a_list:
         - 1
@@ -293,6 +362,53 @@ models:
     # sendLoadingState: overrides the global sendLoadingState setting for this model
     # - optional, default: undefined (use global setting)
     sendLoadingState: false
+
+    # timeouts: configure proxy connection timeouts for this model
+    # - optional, defaults shown below
+    # - useful for models running on slower hardware that need longer timeouts
+    # - connect: TCP dial connection timeout in seconds, default: 30 seconds
+    # - keepalive: TCP connection keepalive timeout, default: 30 seconds
+    # - responseHeader: time to wait for response headers in seconds, default: 0 (no timeout)
+    # - tlsHandshake: TLS handshake timeout in seconds, default: 10 seconds
+    # - idleConn: idle connection timeout in seconds, default: 90 seconds
+    # - set any value to 0 to disable that timeout (not recommended)
+    timeouts:
+      connect: 30
+      keepalive: 0
+      responseHeader: 60
+      tlsHandshake: 10
+      idleConn: 90
+
+    # capabilities: defines what the model accepts for input, output and other metadata
+    # - optional; omitted or all-zero means no capabilities
+    # - used in v1/models to inform clients what the model can do
+    capabilities:
+      # in: list of modalities understood by the model
+      # - default: []
+      # - valid: text, audio, image
+      in:
+        - text
+        - audio
+        - image
+      # out: list of modalities generated by the model
+      # - default: []
+      # - valid: text, audio, image
+      out:
+        - text
+        - audio
+        - image
+      # tools: the model supports function calling
+      # - default: false
+      tools: true
+
+      # reranker: the model supports the /v1/rerank endpoint
+      # - default: false
+      reranker: false
+
+      # context: the maximum token context length supported
+      # - default: 0
+      # - must be an integer > 0
+      context: 32000
 
   # Unlisted model example:
   "qwen-unlisted":
@@ -343,69 +459,6 @@ models:
     # - processes have 5 seconds to shutdown until forceful termination is attempted
     cmdStop: docker stop ${MODEL_ID}
 
-# groups: a dictionary of group settings
-# - optional, default: empty dictionary
-# - provides advanced controls over model swapping behaviour
-# - using groups some models can be kept loaded indefinitely, while others are swapped out
-# - model IDs must be defined in the Models section
-# - a model can only be a member of one group
-# - group behaviour is controlled via the `swap`, `exclusive` and `persistent` fields
-# - see issue #109 for details
-#
-# NOTE: the example below uses model names that are not defined above for demonstration purposes
-groups:
-  # group1 works the same as the default behaviour of llama-swap where only one model is allowed
-  # to run a time across the whole llama-swap instance
-  "group1":
-    # swap: controls the model swapping behaviour in within the group
-    # - optional, default: true
-    # - true : only one model is allowed to run at a time
-    # - false: all models can run together, no swapping
-    swap: true
-
-    # exclusive: controls how the group affects other groups
-    # - optional, default: true
-    # - true: causes all other groups to unload when this group runs a model
-    # - false: does not affect other groups
-    exclusive: true
-
-    # members references the models defined above
-    # required
-    members:
-      - "llama"
-      - "qwen-unlisted"
-
-  # Example:
-  # - in group2 all models can run at the same time
-  # - when a different group is loaded it causes all running models in this group to unload
-  "group2":
-    swap: false
-
-    # exclusive: false does not unload other groups when a model in group2 is requested
-    # - the models in group2 will be loaded but will not unload any other groups
-    exclusive: false
-    members:
-      - "docker-llama"
-      - "modelA"
-      - "modelB"
-
-  # Example:
-  # - a persistent group, prevents other groups from unloading it
-  "forever":
-    # persistent: prevents over groups from unloading the models in this group
-    # - optional, default: false
-    # - does not affect individual model behaviour
-    persistent: true
-
-    # set swap/exclusive to false to prevent swapping inside the group
-    # and the unloading of other groups
-    swap: false
-    exclusive: false
-    members:
-      - "forever-modelA"
-      - "forever-modelB"
-      - "forever-modelc"
-
 # hooks: a dictionary of event triggers and actions
 # - optional, default: empty dictionary
 # - the only supported hook is on_startup
@@ -421,6 +474,176 @@ hooks:
     #   otherwise models will be loaded and swapped out
     preload:
       - "llama"
+
+# routing:
+# Controls how llama-swap decides which models can run at the same time and
+# which get swapped out. Choose one of two swap engines:
+#
+# - group:  the default engine. Simpler to configure. You define groups of
+#           models that run together, and loading one group typically unloads
+#           the others.
+#
+# - matrix: the newer engine. More involved to configure, but far more
+#           flexible. It uses a small expression language to describe which
+#           model combinations are allowed to run concurrently, enabling
+#           setups that groups cannot express.
+#
+# The routing section is optional.
+routing:
+  router:
+    # use: a string defining which engine to use
+    # - optional, default: "group"
+    # - valid values: group, matrix
+    use: group
+
+    # settings: a dictionary of settings for the specific engines
+    settings:
+      # groups: a dictionary of named groups
+      # - optional, default: empty dictionary
+      # - lets you keep some models loaded while others swap out
+      # - every member must be a model ID defined in the models section
+      # - a model can belong to only one group
+      # - behaviour is set per group with the `swap`, `exclusive` and
+      #   `persistent` fields
+      # - see issue #109 for details
+      #
+      # NOTE: the model names below are illustrative and are not defined above.
+      groups:
+        # group1 reproduces llama-swap's default behaviour: only one model
+        # runs at a time across the entire instance.
+        "group1":
+          # swap: how members of this group swap among themselves
+          # - optional, default: true
+          # - true:  only one member runs at a time
+          # - false: all members can run together, no swapping
+          swap: true
+
+          # exclusive: how this group affects other groups
+          # - optional, default: true
+          # - true:  running a member unloads every other group
+          # - false: running a member leaves other groups untouched
+          exclusive: true
+
+          # members: the model IDs in this group
+          # required
+          members:
+            - "llama"
+            - "qwen-unlisted"
+
+        # group2: members all run together, but loading any other group
+        # unloads them.
+        "group2":
+          # swap: false lets all members stay loaded at once
+          swap: false
+
+          # exclusive: false means requesting a member loads it without
+          # unloading any other group
+          exclusive: false
+          members:
+            - "docker-llama"
+            - "modelA"
+            - "modelB"
+
+        # forever: a persistent group that other groups can never unload.
+        "forever":
+          # persistent: other groups cannot unload this group's members
+          # - optional, default: false
+          # - has no effect on swapping within the group
+          persistent: true
+
+          # swap/exclusive: false keeps all members loaded and avoids
+          # unloading other groups
+          swap: false
+          exclusive: false
+          members:
+            - "forever-modelA"
+            - "forever-modelB"
+            - "forever-modelc"
+
+      # The matrix lists the model combinations that are allowed to run
+      # concurrently. When a model is requested, the solver makes room for it
+      # by evicting as few running models as possible, preferring to keep the
+      # costliest ones loaded.
+      #
+      # Solver behaviour:
+      #   1. A request arrives for model X.
+      #   2. If X is already running, forward the request. Done.
+      #   3. Collect every set that contains X.
+      #   4. For each set, add up the evict_costs of the running models that
+      #      are NOT in that set — that is the set's cost.
+      #   5. Choose the lowest-cost set. Break ties by definition order.
+      #   6. Evict the models outside that set, start X, forward the request.
+      #
+      # Subset semantics: a set [a, b, c] also permits any subset of itself.
+      # Only the requested model is started; the others are not preloaded.
+      #
+      # A model that appears in no set can only run on its own.
+      #
+      matrix:
+        # vars: short aliases for model IDs (alphanumeric, 1-8 chars)
+        # - required: sets and evict_costs reference these names, not model IDs
+        # - map each short name to a real model ID (not a model alias)
+        # - keeps the set expressions short and readable
+        vars:
+          g: gemma-model
+          q: qwen-model
+          m: mistral-model
+          v: voxtral-model
+          e: reranker-model
+          L: llama-70B
+          sd: stable-diffusion
+
+        # evict_costs: relative cost of losing a running model (default: 1)
+        evict_costs:
+          v: 50 # vllm backend, slow cold start
+          L: 30 # 70B weights, slow to load
+
+        # sets: named combinations of models that may run together.
+        # Each value is an expression built from these operators:
+        #   &     AND   (models run together)
+        #   |     OR    (alternatives)
+        #   ()    grouping
+        #   +ref  inline the expression of another set
+        #
+        # Each expression expands into one or more concrete sets:
+        #   "L"                  → [L]
+        #   "a & b"              → [a, b]
+        #   "a | b"              → [a], [b]
+        #   "(a | b) & c"        → [a, c], [b, c]
+        #   "(a | b) & (c | d)"  → [a,c], [a,d], [b,c], [b,d]
+        #   "+llms & v"          → inline the llms set, then AND with v
+        sets:
+          # An LLM plus TTS. Switching between g/q/m keeps v loaded.
+          # expands to: [g,v], [q,v], [m,v]
+          standard: "(g | q | m) & v"
+
+          # An LLM plus TTS plus reranker.
+          # expands to: [g,v,e], [q,v,e]
+          with_rerank: "(g | q) & v & e"
+
+          # An LLM plus image generation, no TTS.
+          # expands to: [g,sd], [q,sd]
+          creative: "(g | q) & sd"
+
+          # The 70B model uses every GPU, so it can only run alone.
+          # expands to: [L]
+          full: "L"
+
+  # scheduler: how queued requests are ordered.
+  # The default and only valid scheduler is "fifo"
+  scheduler:
+    use: fifo
+    settings:
+      fifo:
+        # priority: a dictionary of model ID -> priority
+        # - optional, default: empty dictionary
+        # - models default to priority 0
+        # - higher priority requests are serviced first in the queue
+        priority:
+          A: 10
+          B: 5
+          C: 5
+          D: 1
 
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary
@@ -454,6 +677,17 @@ peers:
       - z-ai/glm-4.7
       - moonshotai/kimi-k2-0905
       - minimax/minimax-m2.1
+    # timeouts: configure proxy connection timeouts for this peer
+    # - optional, defaults shown below
+    # - useful when the peer runs on slower hardware
+    # - set any value to 0 to disable that timeout (not recommended)
+    timeouts:
+      connect: 30
+      keepalive: 30
+      responseHeader: 60
+      tlsHandshake: 10
+      idleConn: 90
+
     # filters: a dictionary of filter settings for peer requests
     # - optional, default: empty dictionary
     # - same capabilities as model filters (stripParams, setParams)

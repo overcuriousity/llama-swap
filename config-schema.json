@@ -39,6 +39,121 @@
             },
             "default": {},
             "description": "A dictionary of string substitutions. Macros are reusable snippets used in model cmd, cmdStop, proxy, checkEndpoint, filters.stripParams. Macro names must be <64 chars, match ^[a-zA-Z0-9_-]+$, and not be PORT or MODEL_ID. Values can be string, number, or boolean. Macros can reference other macros defined before them."
+        },
+        "timeouts": {
+            "type": "object",
+            "properties": {
+                "connect": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 30,
+                    "description": "TCP connection timeout in seconds. Set to 0 to disable."
+                },
+                "keepalive": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 30,
+                    "description": "TCP keepalive timeout in seconds. Set to 0 to disable."
+                },
+                "responseHeader": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Time to wait for response headers in seconds. Set to 0 to disable."
+                },
+                "tlsHandshake": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 10,
+                    "description": "TLS handshake timeout in seconds. Set to 0 to disable."
+                },
+                "expectContinue": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 1,
+                    "description": "Expect-Continue timeout in seconds. Set to 0 to disable."
+                },
+                "idleConn": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 90,
+                    "description": "Idle connection timeout in seconds. Set to 0 to disable."
+                }
+            },
+            "additionalProperties": false,
+            "description": "Timeout settings for proxy connections."
+        },
+        "groupsConfig": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "required": [
+                    "members"
+                ],
+                "properties": {
+                    "swap": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Controls model swapping behaviour within the group. True: only one model runs at a time. False: all models can run together."
+                    },
+                    "exclusive": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Controls how the group affects other groups. True: causes all other groups to unload when this group runs a model. False: does not affect other groups."
+                    },
+                    "persistent": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Prevents other groups from unloading the models in this group. Does not affect individual model behaviour."
+                    },
+                    "members": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Array of model IDs that are members of this group. Model IDs must be defined in models."
+                    }
+                }
+            },
+            "description": "A dictionary of group settings. Provides advanced controls over model swapping behaviour. Model IDs must be defined in models. A model can only be a member of one group. Behaviour controlled via swap, exclusive, persistent."
+        },
+        "matrixConfig": {
+            "type": "object",
+            "description": "Solver-based alternative to groups. Declares valid combinations of concurrent models. The solver minimizes eviction cost when swapping. A config must use either groups or matrix, not both.",
+            "required": [
+                "vars",
+                "sets"
+            ],
+            "properties": {
+                "vars": {
+                    "type": "object",
+                    "description": "Short names for models. Keys must be alphanumeric, 1-8 characters. All sets and evict_costs must use these IDs.",
+                    "minProperties": 1,
+                    "additionalProperties": {
+                        "type": "string"
+                    },
+                    "propertyNames": {
+                        "pattern": "^[a-zA-Z0-9]{1,8}$"
+                    }
+                },
+                "evict_costs": {
+                    "type": "object",
+                    "description": "Relative cost of evicting a running model. Models not listed default to 1. Values must be positive integers.",
+                    "additionalProperties": {
+                        "type": "integer",
+                        "minimum": 1
+                    }
+                },
+                "sets": {
+                    "type": "object",
+                    "description": "Named sets of concurrent model combinations. Values are DSL strings using & (AND), | (OR), () (grouping), and +ref (inline another set). Definition order is used for tie-breaking.",
+                    "minProperties": 1,
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "additionalProperties": false
         }
     },
     "properties": {
@@ -53,6 +168,12 @@
             "minimum": 0,
             "default": 0,
             "description": "Default TTL for all models in seconds, 0 means no TTL and models will never be automatically unloaded"
+        },
+        "unloadTimeout": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 10,
+            "description": "Graceful timeout in seconds when unloading a model (manual, API, or TTL expiry) before force-killing the model process. 0 uses the default of 10 seconds."
         },
         "logLevel": {
             "type": "string",
@@ -99,6 +220,66 @@
             "default": 5,
             "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
         },
+        "store": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "SQLite database file path for persistent activity logs."
+                }
+            },
+            "required": [
+                "path"
+            ],
+            "additionalProperties": false,
+            "description": "Store configuration for durable llama-swap state."
+        },
+        "ui": {
+            "type": "object",
+            "properties": {
+                "activity": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "default": [
+                                "X-Session-ID",
+                                "X-Litellm-Session-Id"
+                            ],
+                            "description": "Ordered request headers used to identify sessions in the Activity page."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {}
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Embedded UI configuration."
+        },
+        "performance": {
+            "type": "object",
+            "properties": {
+                "disabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disable system performance monitoring."
+                },
+                "every": {
+                    "type": "string",
+                    "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
+                    "default": "15s",
+                    "description": "Delay between polling for new performance statistics. Minimum duration is 1s. Lower values use more RAM as stats are kept in memory."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Configuration for CPU, RAM and GPU monitoring statistics."
+        },
         "startPort": {
             "type": "integer",
             "default": 5800,
@@ -116,6 +297,48 @@
         },
         "macros": {
             "$ref": "#/definitions/macros"
+        },
+        "profiles": {
+            "type": "object",
+            "default": {},
+            "description": "Runtime-selectable model ID rewrites. One profile or none may be active at runtime.",
+            "propertyNames": {
+                "type": "string",
+                "minLength": 1
+            },
+            "additionalProperties": {
+                "type": "object",
+                "required": [
+                    "pins"
+                ],
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "default": "",
+                        "maxLength": 1024
+                    },
+                    "pins": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "description": "Model IDs to rewrite while this profile is active. An empty string or null disables the model ID.",
+                        "propertyNames": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "additionalProperties": {
+                            "oneOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "additionalProperties": false
+            }
         },
         "models": {
             "type": "object",
@@ -187,6 +410,12 @@
                         "default": -1,
                         "description": "Automatically unload the model after ttl seconds. -1 uses the global TTL value, 0 disables unloading. Must be >0 to enable."
                     },
+                    "unloadTimeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Graceful timeout in seconds when unloading this model (manual, API, or TTL expiry) before force-killing it. 0 uses the global unloadTimeout."
+                    },
                     "useModelName": {
                         "type": "string",
                         "default": "",
@@ -251,44 +480,72 @@
                     "rpcHealthCheck": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Enable TCP health checks for RPC endpoints specified in cmd. When enabled, parses --rpc host:port[,host:port,...] from cmd and performs health checks every 30 seconds. Models with unhealthy RPC endpoints are filtered from /v1/models and return 503 on inference requests."
+                        "description": "Enable TCP health checks for RPC endpoints specified in cmd. When enabled, parses --rpc host:port[,host:port,...] from cmd and performs health checks every 10 seconds. Models with unhealthy RPC endpoints are filtered from /v1/models and return 503 on inference requests."
+                    },
+                    "timeouts": {
+                        "$ref": "#/definitions/timeouts"
+                    },
+                    "capabilities": {
+                        "type": "object",
+                        "properties": {
+                            "in": {
+                                "type": "array",
+                                "minItems": 1,
+                                "uniqueItems": true,
+                                "default": [],
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "text",
+                                        "audio",
+                                        "image"
+                                    ]
+                                },
+                                "description": "List of input modalities understood by the model."
+                            },
+                            "out": {
+                                "type": "array",
+                                "minItems": 1,
+                                "uniqueItems": true,
+                                "default": [],
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "text",
+                                        "audio",
+                                        "image"
+                                    ]
+                                },
+                                "description": "List of output modalities generated by the model."
+                            },
+                            "tools": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether the model supports function calling."
+                            },
+                            "reranker": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether the model supports the /v1/rerank endpoint."
+                            },
+                            "context": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 0,
+                                "description": "Maximum token context length supported by the model."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Defines what the model accepts for input, output and other metadata. Used in v1/models to inform clients what the model can do. An empty capabilities block (all zero values) is treated as not configured."
                     }
                 }
             }
         },
         "groups": {
-            "type": "object",
-            "additionalProperties": {
-                "type": "object",
-                "required": [
-                    "members"
-                ],
-                "properties": {
-                    "swap": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Controls model swapping behaviour within the group. True: only one model runs at a time. False: all models can run together."
-                    },
-                    "exclusive": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Controls how the group affects other groups. True: causes all other groups to unload when this group runs a model. False: does not affect other groups."
-                    },
-                    "persistent": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Prevents other groups from unloading the models in this group. Does not affect individual model behaviour."
-                    },
-                    "members": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Array of model IDs that are members of this group. Model IDs must be defined in models."
-                    }
-                }
-            },
-            "description": "A dictionary of group settings. Provides advanced controls over model swapping behaviour. Model IDs must be defined in models. A model can only be a member of one group. Behaviour controlled via swap, exclusive, persistent."
+            "$ref": "#/definitions/groupsConfig"
+        },
+        "matrix": {
+            "$ref": "#/definitions/matrixConfig"
         },
         "hooks": {
             "type": "object",
@@ -378,11 +635,165 @@
                         "additionalProperties": false,
                         "default": {},
                         "description": "Dictionary of filter settings for peer requests. Supports stripParams and setParams."
+                    },
+                    "timeouts": {
+                        "type": "object",
+                        "properties": {
+                            "connect": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 30,
+                                "description": "TCP connection timeout in seconds."
+                            },
+                            "keepalive": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 30,
+                                "description": "TCP keepalive connection timeout in seconds."
+                            },
+                            "responseHeader": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 0,
+                                "description": "Time to wait for response headers in seconds."
+                            },
+                            "tlsHandshake": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 10,
+                                "description": "TLS handshake timeout in seconds."
+                            },
+                            "idleConn": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 90,
+                                "description": "Idle connection timeout in seconds."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Timeout settings for proxy connections to this peer."
                     }
                 }
             },
             "default": {},
             "description": "A dictionary of remote peers and models they provide. Peers can be another llama-swap or any server that provides the /v1/ generative API endpoints supported by llama-swap."
+        },
+        "upstream": {
+            "type": "object",
+            "description": "Controls behaviour of the /upstream passthrough endpoint. Recommended to only use in special use cases; leaving it as the default will typically be the best experience.",
+            "properties": {
+                "ignorePaths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        ".*\\.(js|json|css|png|gif|jpg|jpeg|ico|txt)$"
+                    ],
+                    "description": "List of RE2 compatible regular expressions. Any request to a path matching any of the regular expressions will be ignored and not trigger a swap. When not specified, defaults to a pattern matching common static-asset suffixes (.js, .json, .css, .png, .gif, .jpg, .jpeg, .ico, .txt)."
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
+        "routing": {
+            "type": "object",
+            "description": "Canonical routing/scheduling configuration. Alternative to the legacy top-level 'groups'/'matrix' keys; a config must not use both styles.",
+            "properties": {
+                "scheduler": {
+                    "type": "object",
+                    "description": "Scheduler configuration. Decides the order in which queued requests are serviced.",
+                    "properties": {
+                        "use": {
+                            "type": "string",
+                            "enum": [
+                                "fifo"
+                            ],
+                            "default": "fifo",
+                            "description": "Scheduler to use. Only 'fifo' is currently supported."
+                        },
+                        "settings": {
+                            "type": "object",
+                            "properties": {
+                                "fifo": {
+                                    "type": "object",
+                                    "properties": {
+                                        "priority": {
+                                            "type": "object",
+                                            "description": "Per-model priority. Keys are model IDs, values are integers (default 0). Higher values are serviced first.",
+                                            "additionalProperties": {
+                                                "type": "integer"
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "router": {
+                    "type": "object",
+                    "description": "Router configuration. Selects between the group and matrix swapping strategies.",
+                    "properties": {
+                        "use": {
+                            "type": "string",
+                            "enum": [
+                                "group",
+                                "matrix"
+                            ],
+                            "default": "group",
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix."
+                        },
+                        "settings": {
+                            "type": "object",
+                            "properties": {
+                                "groups": {
+                                    "$ref": "#/definitions/groupsConfig"
+                                },
+                                "matrix": {
+                                    "$ref": "#/definitions/matrixConfig"
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
         }
-    }
+    },
+    "allOf": [
+        {
+            "if": {
+                "required": [
+                    "groups"
+                ]
+            },
+            "then": {
+                "not": {
+                    "required": [
+                        "matrix"
+                    ]
+                }
+            }
+        },
+        {
+            "if": {
+                "required": [
+                    "matrix"
+                ]
+            },
+            "then": {
+                "not": {
+                    "required": [
+                        "groups"
+                    ]
+                }
+            }
+        }
+    ]
 }

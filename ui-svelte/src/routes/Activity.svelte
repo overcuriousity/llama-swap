@@ -1,125 +1,129 @@
 <script lang="ts">
-  import { metrics, getCapture } from "../stores/api";
-  import Tooltip from "../components/Tooltip.svelte";
-  import CaptureDialog from "../components/CaptureDialog.svelte";
-  import type { ReqRespCapture } from "../lib/types";
+  import { untrack } from "svelte";
+  import type { ActivityLogEntry, ActivityStatsData } from "../lib/types";
+  import { activityRevision, getActivity, getActivityStats, inflightRequestEntries } from "../stores/api";
+  import { connectionState } from "../stores/theme";
+  import { persistentStore } from "../stores/persistent";
+  import ActivityStats from "../components/ActivityStats.svelte";
+  import ActivityTable from "../components/ActivityTable.svelte";
 
-  function formatSpeed(speed: number): string {
-    return speed < 0 ? "unknown" : speed.toFixed(2) + " t/s";
-  }
+  const storedPageSize = persistentStore<number>("activity-page-size", 25);
 
-  function formatDuration(ms: number): string {
-    return (ms / 1000).toFixed(2) + "s";
-  }
+  let rows = $state<ActivityLogEntry[]>([]);
+  let stats = $state<ActivityStatsData | null>(null);
+  let page = $state(1);
+  let limit = $state($storedPageSize);
+  let sort = $state("id");
+  let order = $state<"asc" | "desc">("desc");
+  let total = $state(0);
+  let totalPages = $state(0);
+  let requestID = 0;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastRefresh = 0;
 
-  function formatRelativeTime(timestamp: string): string {
-    const now = new Date();
-    const date = new Date(timestamp);
-    const diffInSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
-
-    // Handle future dates by returning "just now"
-    if (diffInSeconds < 5) {
-      return "now";
+  async function refreshActivity() {
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
     }
-
-    if (diffInSeconds < 60) {
-      return `${diffInSeconds}s ago`;
-    }
-
-    const diffInMinutes = Math.floor(diffInSeconds / 60);
-    if (diffInMinutes < 60) {
-      return `${diffInMinutes}m ago`;
-    }
-
-    const diffInHours = Math.floor(diffInMinutes / 60);
-    if (diffInHours < 24) {
-      return `${diffInHours}h ago`;
-    }
-
-    return "a while ago";
-  }
-
-  let sortedMetrics = $derived([...$metrics].sort((a, b) => b.id - a.id));
-
-  let selectedCapture = $state<ReqRespCapture | null>(null);
-  let dialogOpen = $state(false);
-  let loadingCaptureId = $state<number | null>(null);
-
-  async function viewCapture(id: number) {
-    loadingCaptureId = id;
-    const capture = await getCapture(id);
-    loadingCaptureId = null;
-    if (capture) {
-      selectedCapture = capture;
-      dialogOpen = true;
+    lastRefresh = Date.now();
+    const id = ++requestID;
+    try {
+      const [activity, activityStats] = await Promise.all([
+        getActivity({ page, limit, sort, order }),
+        getActivityStats(),
+      ]);
+      if (id !== requestID) return;
+      rows = activity.data;
+      total = activity.total;
+      totalPages = activity.total_pages;
+      stats = activityStats;
+    } catch (error) {
+      console.error("Failed to refresh activity:", error);
     }
   }
 
-  function closeDialog() {
-    dialogOpen = false;
-    selectedCapture = null;
+  function setPage(nextPage: number) {
+    page = nextPage;
   }
+
+  function setPageSize(nextLimit: number) {
+    limit = nextLimit;
+    page = 1;
+    storedPageSize.set(nextLimit);
+  }
+
+  function setSort(nextSort: string, nextOrder: "asc" | "desc") {
+    sort = nextSort;
+    order = nextOrder;
+    page = 1;
+  }
+
+  // scheduleRefresh throttles SSE-driven refreshes to one per second; a
+  // user-driven refreshActivity cancels any pending timer.
+  function scheduleRefresh() {
+    if (refreshTimer !== null) return;
+    const wait = Math.max(0, 1000 - (Date.now() - lastRefresh));
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      refreshActivity();
+    }, wait);
+  }
+
+  // Refresh immediately on connect and when the user changes paging/sorting.
+  $effect(() => {
+    if ($connectionState !== "connected") return;
+    page;
+    limit;
+    sort;
+    order;
+    untrack(() => {
+      refreshActivity();
+    });
+  });
+
+  // New activity only changes what page 1 shows; skip SSE-driven refreshes
+  // while browsing older pages. seenRevision keeps the effect's initial run
+  // (and re-runs from other deps) from scheduling a redundant fetch.
+  let seenRevision = $activityRevision;
+  $effect(() => {
+    if ($connectionState !== "connected") return;
+    const revision = $activityRevision;
+    untrack(() => {
+      if (revision === seenRevision) return;
+      seenRevision = revision;
+      if (page === 1) scheduleRefresh();
+    });
+  });
+
+  $effect(() => {
+    return () => {
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
+    };
+  });
 </script>
 
 <div class="p-2">
-  <h1 class="text-2xl font-bold">Activity</h1>
+  <div class="mt-4 mb-4">
+    <ActivityStats {stats} />
+  </div>
 
-  {#if $metrics.length === 0}
-    <div class="text-center py-8">
-      <p class="text-gray-600">No metrics data available</p>
-    </div>
-  {:else}
-    <div class="card overflow-auto">
-      <table class="min-w-full divide-y">
-        <thead class="border-gray-200 dark:border-white/10">
-          <tr class="text-left text-xs uppercase tracking-wider">
-            <th class="px-6 py-3">ID</th>
-            <th class="px-6 py-3">Time</th>
-            <th class="px-6 py-3">Model</th>
-            <th class="px-6 py-3">
-              Cached <Tooltip content="prompt tokens from cache" />
-            </th>
-            <th class="px-6 py-3">
-              Prompt <Tooltip content="new prompt tokens processed" />
-            </th>
-            <th class="px-6 py-3">Generated</th>
-            <th class="px-6 py-3">Prompt Processing</th>
-            <th class="px-6 py-3">Generation Speed</th>
-            <th class="px-6 py-3">Duration</th>
-            <th class="px-6 py-3">Capture</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y">
-          {#each sortedMetrics as metric (metric.id)}
-            <tr class="whitespace-nowrap text-sm border-gray-200 dark:border-white/10">
-              <td class="px-4 py-4">{metric.id + 1}</td>
-              <td class="px-6 py-4">{formatRelativeTime(metric.timestamp)}</td>
-              <td class="px-6 py-4">{metric.model}</td>
-              <td class="px-6 py-4">{metric.cache_tokens > 0 ? metric.cache_tokens.toLocaleString() : "-"}</td>
-              <td class="px-6 py-4">{metric.input_tokens.toLocaleString()}</td>
-              <td class="px-6 py-4">{metric.output_tokens.toLocaleString()}</td>
-              <td class="px-6 py-4">{formatSpeed(metric.prompt_per_second)}</td>
-              <td class="px-6 py-4">{formatSpeed(metric.tokens_per_second)}</td>
-              <td class="px-6 py-4">{formatDuration(metric.duration_ms)}</td>
-              <td class="px-6 py-4">
-                {#if metric.has_capture}
-                  <button
-                    onclick={() => viewCapture(metric.id)}
-                    disabled={loadingCaptureId === metric.id}
-                    class="btn btn--sm"
-                  >
-                    {loadingCaptureId === metric.id ? "..." : "View"}
-                  </button>
-                {:else}
-                  <span class="text-txtsecondary">-</span>
-                {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  {/if}
+  <ActivityTable
+    metrics={rows}
+    inflightRequests={$inflightRequestEntries}
+    storagePrefix="activity"
+    showModelColumn={true}
+    showPagination={true}
+    {page}
+    {limit}
+    {total}
+    totalPages={totalPages}
+    onPageChange={setPage}
+    onPageSizeChange={setPageSize}
+    {sort}
+    {order}
+    onSortChange={setSort}
+    cardClass="min-h-[30rem] overflow-auto"
+    emptyMessage="No activity recorded"
+  />
 </div>
-
-<CaptureDialog capture={selectedCapture} open={dialogOpen} onclose={closeDialog} />

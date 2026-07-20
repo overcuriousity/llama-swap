@@ -14,8 +14,8 @@
   let saving = $state(false);
   let direction = $derived<"horizontal" | "vertical">($isNarrow ? "vertical" : "horizontal");
   
-  let editorContainer: HTMLDivElement;
-  let exampleContainer: HTMLDivElement;
+  let editorContainer = $state<HTMLDivElement | undefined>(undefined);
+  let exampleContainer = $state<HTMLDivElement | undefined>(undefined);
   let editorView: EditorView | null = null;
   let exampleView: EditorView | null = null;
   let themeCompartment = new Compartment();

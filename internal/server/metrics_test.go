@@ -1,114 +1,172 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/shared"
-	"github.com/tidwall/gjson"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
-	body := `{"usage":{"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}}}`
-	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
-	if err != nil {
-		t.Fatalf("parseMetrics: %v", err)
+func TestServer_ActivitySourceStripsClientPort(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{name: "IPv4", remoteAddr: "192.168.1.10:54321", want: "ip:192.168.1.10"},
+		{name: "IPv6", remoteAddr: "[2001:db8::10]:54321", want: "ip:2001:db8::10"},
+		{name: "missing port", remoteAddr: "localhost", want: "ip:localhost"},
 	}
-	if entry.Tokens.InputTokens != 12 || entry.Tokens.OutputTokens != 7 || entry.Tokens.CachedTokens != 4 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-}
-
-func TestServer_ParseMetrics_Timings(t *testing.T) {
-	body := `{"timings":{"prompt_n":20,"predicted_n":50,"prompt_per_second":100.0,"predicted_per_second":40.0,"prompt_ms":200,"predicted_ms":1250,"cache_n":8}}`
-	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
-	if err != nil {
-		t.Fatalf("parseMetrics: %v", err)
-	}
-	if entry.Tokens.InputTokens != 20 || entry.Tokens.OutputTokens != 50 || entry.Tokens.CachedTokens != 8 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-	if entry.Tokens.TokensPerSecond != 40.0 || entry.Tokens.PromptPerSecond != 100.0 {
-		t.Fatalf("rates = %+v", entry.Tokens)
-	}
-	if entry.DurationMs != 1450 {
-		t.Fatalf("DurationMs = %d, want 1450", entry.DurationMs)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = test.remoteAddr
+			if got := activitySource(r); got != test.want {
+				t.Fatalf("activitySource() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
-func TestServer_ProcessStreamingResponse(t *testing.T) {
-	body := []byte("data: {\"choices\":[{}]}\n\n" +
-		"data: {\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":33}}\n\n" +
-		"data: [DONE]\n\n")
-	entry, err := processStreamingResponse("m", time.Now(), body)
-	if err != nil {
-		t.Fatalf("processStreamingResponse: %v", err)
+func TestServer_ActivitySourceForwardedHeaders(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*http.Request)
+		want  string
+	}{
+		{"x-forwarded-for", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "203.0.113.10, 10.0.0.1")
+		}, "xff:203.0.113.10"},
+		{"x-real-ip", func(r *http.Request) {
+			r.Header.Set("X-Real-IP", "203.0.113.20")
+		}, "xff:203.0.113.20"},
+		{"x-forwarded-for takes priority over x-real-ip", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "203.0.113.10")
+			r.Header.Set("X-Real-IP", "203.0.113.20")
+		}, "xff:203.0.113.10"},
+		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "   , 10.0.0.1")
+			r.Header.Set("X-Real-IP", "203.0.113.20")
+		}, "xff:203.0.113.20"},
+		{"x-forwarded-for empty first entry falls back to remote addr", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", ",10.0.0.1")
+		}, "ip:192.168.1.10"},
 	}
-	if entry.Tokens.InputTokens != 15 || entry.Tokens.OutputTokens != 33 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-}
-
-func TestServer_ProcessStreamingResponse_VLLMMetrics(t *testing.T) {
-	body := []byte(`data: {"id":"chatcmpl-b7a832cea986aea4","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":14,"total_tokens":166,"completion_tokens":152},"metrics":{"time_to_first_token_ms":70,"mean_itl_ms":10,"tokens_per_second":24.116032676555495}}
-
-data: [DONE]
-`)
-	entry, err := processStreamingResponse("m", time.Now(), body)
-	if err != nil {
-		t.Fatalf("processStreamingResponse: %v", err)
-	}
-	if entry.Tokens.InputTokens != 14 || entry.Tokens.OutputTokens != 152 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-	if entry.Tokens.CachedTokens != -1 {
-		t.Errorf("CachedTokens = %d, want -1", entry.Tokens.CachedTokens)
-	}
-	if got, want := entry.Tokens.PromptPerSecond, 200.0; math.Abs(got-want) > 1e-9 {
-		t.Errorf("PromptPerSecond = %v, want %v", got, want)
-	}
-	if entry.Tokens.TokensPerSecond != 100 {
-		t.Errorf("TokensPerSecond = %v, want 100", entry.Tokens.TokensPerSecond)
-	}
-}
-
-func TestServer_ParseMetrics_VLLMMetrics(t *testing.T) {
-	body := `{"id":"chatcmpl-abc123","object":"chat.completion","usage":{"prompt_tokens":42,"completion_tokens":128,"total_tokens":170,"prompt_tokens_details":{"cached_tokens":20}},"metrics":{"time_to_first_token_ms":85.2,"generation_time_ms":1240.5,"queue_time_ms":12.3,"mean_itl_ms":9.1,"tokens_per_second":103.2}}`
-	parsed := gjson.Parse(body)
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), parsed.Get("timings"), parsed.Get("metrics"))
-	if err != nil {
-		t.Fatalf("parseMetrics: %v", err)
-	}
-	if entry.Tokens.InputTokens != 42 || entry.Tokens.OutputTokens != 128 || entry.Tokens.CachedTokens != 20 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-	if got, want := entry.Tokens.PromptPerSecond, float64(42-20)/(85.2/1000); math.Abs(got-want) > 1e-9 {
-		t.Errorf("PromptPerSecond = %v, want %v", got, want)
-	}
-	if got, want := entry.Tokens.TokensPerSecond, 1000/9.1; math.Abs(got-want) > 1e-9 {
-		t.Errorf("TokensPerSecond = %v, want %v", got, want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = "192.168.1.10:54321"
+			test.setup(r)
+			if got := activitySource(r); got != test.want {
+				t.Fatalf("activitySource() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
-func TestServer_ProcessStreamingResponse_NoData(t *testing.T) {
-	if _, err := processStreamingResponse("m", time.Now(), []byte("data: [DONE]\n\n")); err == nil {
-		t.Fatal("expected error for stream with no usage data")
+func TestServer_MetricsMiddleware_OMLX(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		name := "JSON"
+		if streaming {
+			name = "SSE"
+		}
+		t.Run(name, func(t *testing.T) {
+			mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+			cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+			body := `{"usage":{"prompt_tokens":56,"completion_tokens":8,"prompt_tokens_per_second":63.74,"generation_tokens_per_second":66.38}}`
+			contentType := "application/json"
+			if streaming {
+				contentType = "text/event-stream"
+				body = "data: " + body + "\n\ndata: [DONE]\n\n"
+			}
+			handler := chain.New(CreateMetricsMiddleware(mm, cfg)).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", contentType)
+				io.WriteString(w, body)
+			})
+			r := chatRequest("m")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			if w.Code != http.StatusOK || w.Body.String() != body {
+				t.Fatalf("response = %d %q, want 200 %q", w.Code, w.Body.String(), body)
+			}
+			entries := metricsEntries(t, mm)
+			if len(entries) != 1 {
+				t.Fatalf("want 1 entry, got %d", len(entries))
+			}
+			entry := entries[0]
+			if entry.Model != "m" || entry.Tokens.InputTokens != 56 || entry.Tokens.OutputTokens != 8 || entry.Tokens.PromptPerSecond != 63.74 || entry.Tokens.TokensPerSecond != 66.38 {
+				t.Fatalf("recorded activity = %+v", entry)
+			}
+		})
+	}
+}
+
+// TestServer_MetricsMiddleware_TensorFold runs the captured TensorFold
+// responses from #1226 through the middleware and checks the client still
+// receives them unchanged.
+func TestServer_MetricsMiddleware_TensorFold(t *testing.T) {
+	tests := []struct {
+		name, file, contentType string
+		input, output           int
+		wantPrompt, wantGen     float64
+	}{
+		{"JSON", "chat_completion.json", "application/json", 63, 64, 63 / 0.1146, 64 / 2.0696},
+		{"SSE", "chat_completion_stream.sse", "text/event-stream", 59, 32, 59 / 0.2393, 32 / 0.7758},
+		{"SSE renamed fields", "chat_completion_stream_v2.sse", "text/event-stream", 160029, 11811, 160029 / 57.476540016, 46.31119504068745},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("usage", "testdata", "tensorfold", tt.file))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+			cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+			handler := chain.New(CreateMetricsMiddleware(mm, cfg)).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.Write(body)
+			})
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, chatRequest("m"))
+			if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), body) {
+				t.Fatalf("response = %d, want 200 with the fixture body", w.Code)
+			}
+			entries := metricsEntries(t, mm)
+			if len(entries) != 1 {
+				t.Fatalf("want 1 entry, got %d", len(entries))
+			}
+			got := entries[0].Tokens
+			if entries[0].Model != "m" || got.InputTokens != tt.input || got.OutputTokens != tt.output || got.CachedTokens != 0 {
+				t.Fatalf("recorded activity = %+v", entries[0])
+			}
+			if want := tt.wantPrompt; math.Abs(got.PromptPerSecond-want) > 1e-9 {
+				t.Errorf("PromptPerSecond = %v, want %v", got.PromptPerSecond, want)
+			}
+			if want := tt.wantGen; math.Abs(got.TokensPerSecond-want) > 1e-9 {
+				t.Errorf("TokensPerSecond = %v, want %v", got.TokensPerSecond, want)
+			}
+		})
 	}
 }
 
 func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	mm := newTestMetricsMonitor(t, nil, 10, 0)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"usage":{}}`))
-	r = r.WithContext(shared.SetContext(r.Context(), shared.ReqContextData{
+	r = r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{
 		ModelID:  "m",
 		Metadata: map[string]string{"client": "web", "trace": "abc"},
 	}))
@@ -118,7 +176,7 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
 
-	mm.record("m", r, copier, 0, nil, nil)
+	mm.record("m", hint.TaskChat, r, copier, 0, nil, nil)
 
 	entries := metricsEntries(t, mm)
 	if len(entries) != 1 {
@@ -129,6 +187,120 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	}
 	if entries[0].Metadata["trace"] != "abc" {
 		t.Errorf("trace = %q, want abc", entries[0].Metadata["trace"])
+	}
+}
+
+// TestMetricsMonitor_RecordClientClosed covers #1029: a client that hangs up
+// before a response is written must not be filed as a successful (empty-body)
+// metric. It is recorded with the 499 sentinel and a client-cancelled
+// ErrorMsg, and skips the capture the upstream-failure path would store.
+func TestMetricsMonitor_RecordClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 5)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	w := httptest.NewRecorder()
+	copier := newBodyCopier(w)
+	// Nothing is ever written: this is the cold-load cancellation shape.
+	copier.MarkStatus(swaputil.StatusClientClosedRequest)
+
+	mm.record("m", hint.TaskChat, r, copier, captureAll, []byte("req"), nil)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if entry.RespStatusCode != swaputil.StatusClientClosedRequest {
+		t.Errorf("status = %d, want %d", entry.RespStatusCode, swaputil.StatusClientClosedRequest)
+	}
+	if entry.ErrorMsg != "client disconnected before response" {
+		t.Errorf("error_msg = %q, want client-cancelled message", entry.ErrorMsg)
+	}
+	if entry.HasCapture {
+		t.Error("a cancelled request has no response to capture")
+	}
+}
+
+// TestServer_MetricsMiddleware_ClientClosed checks the middleware derives the
+// sentinel for a handler that returns without writing, and that the marker
+// propagates outward to the access-log recorder so both agree.
+func TestServer_MetricsMiddleware_ClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+
+	proxylog := logmon.NewWriter(io.Discard)
+	handler := chain.New(
+		CreateRequestLogMiddleware(proxylog),
+		CreateMetricsMiddleware(mm, cfg),
+	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = "192.168.1.1:5000"
+	cancel()
+
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].RespStatusCode != swaputil.StatusClientClosedRequest {
+		t.Errorf("activity status = %d, want %d", entries[0].RespStatusCode, swaputil.StatusClientClosedRequest)
+	}
+	if line := string(proxylog.GetHistory()); !strings.Contains(line, "499 0") {
+		t.Errorf("access log %q should report 499", line)
+	}
+}
+
+// TestServer_MetricsMiddleware_ServerSideCancelIsNotClientClosed guards the
+// distinction #1029's fix depends on. The inflight middleware derives a
+// cancellable context that POST /api/inflight/{id}/cancel fires, so testing
+// "is this request's context done?" would report an operator cancelling a
+// request from the UI as a client that hung up.
+func TestServer_MetricsMiddleware_ServerSideCancelIsNotClientClosed(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 10, 0)
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+
+	proxylog := logmon.NewWriter(io.Discard)
+	// The handler stands in for a dispatch that is cancelled mid-flight and
+	// answers the still-connected client, as the proxy ErrorHandler does.
+	handler := chain.New(
+		CreateRequestLogMiddleware(proxylog),
+		CreateMetricsMiddleware(mm, cfg),
+	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
+		derived, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		cancel() // the operator cancels it
+		r = r.WithContext(derived)
+		if swaputil.MarkClientClosed(w, r) {
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	})
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = "192.168.1.1:5000"
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("client got %d, want %d: a connected client must be answered", w.Code, http.StatusBadGateway)
+	}
+	entries := metricsEntries(t, mm)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].RespStatusCode == swaputil.StatusClientClosedRequest {
+		t.Error("a server-side cancel must not be recorded as a client disconnect")
+	}
+	if line := string(proxylog.GetHistory()); strings.Contains(line, "499") {
+		t.Errorf("access log %q should not report 499 for a connected client", line)
 	}
 }
 
@@ -144,7 +316,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 	copier.Write([]byte(`{"error":{"message":"model unavailable"}}`))
 
 	reqBody := []byte(`{"model":"m","messages":[]}`)
-	mm.record("m", r, copier, captureAll, reqBody, reqHeaders)
+	mm.record("m", hint.TaskChat, r, copier, captureAll, reqBody, reqHeaders)
 
 	entries := metricsEntries(t, mm)
 	if len(entries) != 1 {
@@ -161,7 +333,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 		t.Fatal("failed request should capture the request so it can be inspected")
 	}
 
-	got := mm.getCaptureByID(entry.ID)
+	got := mm.getCaptureByID(entry.CaptureID)
 	if got == nil {
 		t.Fatal("capture not found")
 	}
@@ -186,7 +358,7 @@ func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 	copier.WriteHeader(http.StatusBadGateway)
 	copier.Write([]byte("<html>upstream down</html>"))
 
-	mm.record("m", r, copier, captureAll, nil, nil)
+	mm.record("m", hint.TaskChat, r, copier, captureAll, nil, nil)
 
 	entries := metricsEntries(t, mm)
 	if len(entries) != 1 {
@@ -206,7 +378,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 	copier.WriteHeader(http.StatusInternalServerError)
 	copier.Write([]byte(`{"error":"boom"}`))
 
-	mm.record("m", r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", hint.TaskChat, r, copier, captureAll, []byte("req"), nil)
 
 	entries := metricsEntries(t, mm)
 	if len(entries) != 1 {
@@ -219,7 +391,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 	if entries[0].ErrorMsg != "boom" {
 		t.Errorf("error_msg = %q, want boom", entries[0].ErrorMsg)
 	}
-	if mm.getCaptureByID(entries[0].ID) != nil {
+	if mm.getCaptureByID(entries[0].CaptureID) != nil {
 		t.Fatal("no capture should be stored when disabled")
 	}
 }
@@ -234,7 +406,7 @@ func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte("not-really-gzip"))
 
-	mm.record("m", r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", hint.TaskChat, r, copier, captureAll, []byte("req"), nil)
 
 	entries := metricsEntries(t, mm)
 	if len(entries) != 1 {
@@ -298,23 +470,6 @@ func TestServer_ExtractErrorMessage(t *testing.T) {
 	}
 }
 
-func TestServer_ParseMetrics_Infill(t *testing.T) {
-	// /infill responses are arrays; timings live in the last element.
-	body := `[{"content":"a"},{"content":"b","timings":{"prompt_n":5,"predicted_n":9,"prompt_ms":10,"predicted_ms":20}}]`
-	parsed := gjson.Parse(body)
-	timings := parsed.Get("timings")
-	if arr := parsed.Array(); len(arr) > 0 {
-		timings = arr[len(arr)-1].Get("timings")
-	}
-	entry, err := parseMetrics("m", time.Now(), parsed.Get("usage"), timings, parsed.Get("metrics"))
-	if err != nil {
-		t.Fatalf("parseMetrics: %v", err)
-	}
-	if entry.Tokens.InputTokens != 5 || entry.Tokens.OutputTokens != 9 {
-		t.Fatalf("tokens = %+v", entry.Tokens)
-	}
-}
-
 // TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody verifies that
 // an /upstream/<model>/v1/audio/speech request uses the path-specific capture
 // mask (headers only) rather than falling back to captureAll.
@@ -340,7 +495,7 @@ func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T
 	if !last.HasCapture {
 		t.Fatal("expected capture to be stored")
 	}
-	cap := mm.getCaptureByID(last.ID)
+	cap := mm.getCaptureByID(last.CaptureID)
 	if cap == nil {
 		t.Fatal("capture not found")
 	}
@@ -350,4 +505,78 @@ func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T
 	if len(cap.RespHeaders) == 0 {
 		t.Error("RespHeaders not stored; want captureRespHeaders mask")
 	}
+}
+
+func TestMetricsMonitor_RecordStoresHint(t *testing.T) {
+	mm := newTestMetricsMonitor(t, nil, 10, 0)
+	ctx, h := hint.New(httptest.NewRequest(http.MethodPost, "/", nil).Context())
+	h.Route = hint.RoutePeer
+	h.PeerID = "cloud"
+	h.Upstream = hint.VLLM
+	r := httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil).WithContext(ctx)
+
+	copier := newBodyCopier(httptest.NewRecorder())
+	copier.Header().Set("Content-Type", "application/json")
+	copier.WriteHeader(http.StatusOK)
+	copier.Write([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":20},"metrics":{"time_to_first_token_ms":100,"mean_itl_ms":20}}`))
+
+	mm.record("m", hint.TaskEmbedding, r, copier, 0, nil, nil)
+
+	entries := metricsEntries(t, mm)
+	require.Len(t, entries, 1)
+	e := entries[0]
+	assert.Equal(t, string(hint.TaskEmbedding), e.Task)
+	assert.Equal(t, string(hint.RoutePeer), e.Route)
+	assert.Equal(t, "cloud", e.PeerID)
+	// The vLLM hint selects the vLLM extractor, which reads metrics only.
+	assert.InDelta(t, 50.0, e.Tokens.TokensPerSecond, 1e-9)
+	assert.Equal(t, -1, e.Tokens.ReasoningTokens)
+}
+
+func TestMetricsMonitor_RecordHipfire(t *testing.T) {
+	for _, upstream := range []hint.Upstream{hint.Hipfire, hint.Unknown} {
+		for _, streaming := range []bool{false, true} {
+			mm := newTestMetricsMonitor(t, nil, 10, 0)
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			ctx, h := hint.New(r.Context())
+			h.Upstream = upstream
+			r = r.WithContext(ctx)
+			body := `{"usage":{"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}},"timings":{"prefill_tok_s":200,"decode_tok_s":40}}`
+			copier := newBodyCopier(httptest.NewRecorder())
+			if streaming {
+				copier.Header().Set("Content-Type", "text/event-stream")
+				body = "data: " + body + "\n\ndata: [DONE]\n\n"
+			} else {
+				copier.Header().Set("Content-Type", "application/json")
+			}
+			copier.WriteHeader(http.StatusOK)
+			copier.Write([]byte(body))
+			mm.record("hipfire", hint.TaskChat, r, copier, 0, nil, nil)
+			entries := metricsEntries(t, mm)
+			require.Len(t, entries, 1)
+			tokens := entries[0].Tokens
+			assert.Equal(t, 12, tokens.InputTokens)
+			assert.Equal(t, 7, tokens.OutputTokens)
+			assert.Equal(t, 4, tokens.CachedTokens)
+			assert.Equal(t, 200.0, tokens.PromptPerSecond)
+			assert.Equal(t, 40.0, tokens.TokensPerSecond)
+		}
+	}
+}
+
+func TestMetricsMonitor_RecordWithoutHint(t *testing.T) {
+	mm := newTestMetricsMonitor(t, nil, 10, 0)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	copier := newBodyCopier(httptest.NewRecorder())
+	copier.WriteHeader(http.StatusOK)
+	copier.Write([]byte(`{"error":"boom"}`))
+
+	mm.record("m", hint.TaskChat, r, copier, 0, nil, nil)
+
+	entries := metricsEntries(t, mm)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "chat", entries[0].Task)
+	assert.Empty(t, entries[0].Route)
+	assert.Empty(t, entries[0].PeerID)
 }

@@ -160,6 +160,20 @@ func TestServer_StripVersionPrefix(t *testing.T) {
 	}
 }
 
+func TestServer_StripAudioAPIPrefix(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/audioapi/v1/tasks/run", nil)
+	stripAudioAPIPrefix(r)
+	if r.URL.Path != "/v1/tasks/run" {
+		t.Errorf("path = %q, want /v1/tasks/run", r.URL.Path)
+	}
+
+	r2 := httptest.NewRequest(http.MethodGet, "/v1/tasks/run", nil)
+	stripAudioAPIPrefix(r2)
+	if r2.URL.Path != "/v1/tasks/run" {
+		t.Errorf("path = %q, want unchanged", r2.URL.Path)
+	}
+}
+
 func TestServer_CloseStreams(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.CloseStreams()
@@ -182,6 +196,37 @@ func TestServer_HandleUIAndFavicon(t *testing.T) {
 		if w.Code != http.StatusOK && w.Code != http.StatusNotFound {
 			t.Errorf("%s: status = %d", path, w.Code)
 		}
+	}
+}
+
+// TestServer_WebManifestBypassesAuth reproduces issue #1175: the browser
+// fetches /ui/site.webmanifest and the icons it references itself while
+// deciding whether to offer installing the PWA, and can't attach an API key,
+// so they must stay reachable even when apiKeys is set, while the rest of
+// /ui/ stays protected.
+func TestServer_WebManifestBypassesAuth(t *testing.T) {
+	cfg := config.Config{RequiredAPIKeys: []string{"secret"}}
+	s := newTestServerWithConfig(cfg, newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	for _, path := range []string{
+		"/ui/site.webmanifest",
+		"/ui/web-app-manifest-192x192.png",
+		"/ui/web-app-manifest-512x512.png",
+	} {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		// Tests build without the `embed_ui` tag, so uiFS is empty and this
+		// resolves to 404 rather than 200 — what matters is that auth didn't
+		// reject it first with 401.
+		if w.Code == http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want not 401", path, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ui/", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("/ui/: status = %d, want 401", w.Code)
 	}
 }
 
@@ -237,11 +282,12 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 func TestServer_HandleAPICapture(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.metrics = newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
-	s.metrics.addCapture(ReqRespCapture{ID: 42, ReqPath: "/v1/chat/completions"})
+	captureID := s.metrics.newCaptureID(testClock)
+	s.metrics.addCapture(captureID, ReqRespCapture{ID: 42, ReqPath: "/v1/chat/completions"})
 
 	t.Run("found", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/42", nil))
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/"+captureID, nil))
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d", w.Code)
 		}
@@ -252,7 +298,7 @@ func TestServer_HandleAPICapture(t *testing.T) {
 
 	t.Run("not found", func(t *testing.T) {
 		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/999", nil))
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/26103120-zzzz", nil))
 		if w.Code != http.StatusNotFound {
 			t.Errorf("status = %d, want 404", w.Code)
 		}

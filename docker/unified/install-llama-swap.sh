@@ -4,6 +4,9 @@
 #   version: release version number (e.g., "170") or "latest" (default)
 set -e
 
+# shellcheck source=lib-release.sh
+source "$(dirname "$0")/lib-release.sh"
+
 VERSION="${1:-latest}"
 REPO="mostlygeek/llama-swap"
 
@@ -29,8 +32,7 @@ VERSION="${VERSION#v}"
 # Resolve "latest" to actual version number
 if [ "$VERSION" = "latest" ]; then
     echo "=== Resolving latest llama-swap release ==="
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    VERSION=$(resolve_latest_version "${REPO}")
     if [ -z "$VERSION" ]; then
         echo "FATAL: Could not determine latest release version" >&2
         exit 1
@@ -50,7 +52,9 @@ esac
 URL="https://github.com/${REPO}/releases/download/v${VERSION}/llama-swap_${VERSION}_linux_${ARCH}.tar.gz"
 echo "=== Downloading llama-swap v${VERSION} ==="
 echo "URL: $URL"
-curl -fSL -o /tmp/llama-swap.tar.gz "$URL"
+# GitHub's release download returns an occasional 502/504; retry those rather
+# than failing an assemble job that has already waited hours on the compiles.
+curl -fSL --retry 5 --retry-all-errors --retry-delay 10 -o /tmp/llama-swap.tar.gz "$URL"
 tar -xzf /tmp/llama-swap.tar.gz -C /install/bin/
 rm /tmp/llama-swap.tar.gz
 

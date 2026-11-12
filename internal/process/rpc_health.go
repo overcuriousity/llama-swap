@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,9 @@ const (
 type rpcHealth struct {
 	endpoints []string
 	healthy   atomic.Bool
+
+	// dial probes one endpoint; nil uses a TCP dial. Replaced in tests.
+	dial func(endpoint string) error
 }
 
 // initRPCHealth parses the --rpc endpoints out of the model command and starts
@@ -64,24 +68,43 @@ func (p *ProcessCommand) pollRPCHealth(h *rpcHealth) {
 }
 
 func (p *ProcessCommand) checkRPCHealth(h *rpcHealth) {
+	dial := h.dial
+	if dial == nil {
+		dial = func(endpoint string) error {
+			conn, err := net.DialTimeout("tcp", endpoint, rpcHealthDialTimeout)
+			if err == nil {
+				conn.Close()
+			}
+			return err
+		}
+	}
+
 	allHealthy := true
+	timedOut := false
 
 	for _, endpoint := range h.endpoints {
-		dialer := net.Dialer{Timeout: rpcHealthDialTimeout}
-		conn, err := dialer.Dial("tcp", endpoint)
-		if err != nil {
-			// A dial timeout means the endpoint is slow, not gone. Treating it
-			// as unhealthy causes loaded models to be rejected during transient
-			// network stalls, so only hard failures flip the flag.
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				p.proxyLogger.Debugf("<%s> RPC endpoint %s timeout (ignoring): %v", p.id, endpoint, err)
-				continue
-			}
-			p.proxyLogger.Warnf("<%s> RPC endpoint %s unhealthy: %v", p.id, endpoint, err)
-			allHealthy = false
-			break
+		err := dial(endpoint)
+		if err == nil {
+			continue
 		}
-		conn.Close()
+		// A dial timeout means the endpoint is slow or silently dropping
+		// packets, which this check cannot tell apart. It neither proves nor
+		// disproves health, so it leaves the current state alone: a loaded
+		// model is not rejected during a transient stall, and an endpoint that
+		// has never answered does not become healthy by timing out.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			p.proxyLogger.Debugf("<%s> RPC endpoint %s timeout: %v", p.id, endpoint, err)
+			timedOut = true
+			continue
+		}
+		p.proxyLogger.Warnf("<%s> RPC endpoint %s unhealthy: %v", p.id, endpoint, err)
+		allHealthy = false
+		break
+	}
+
+	if allHealthy && timedOut {
+		return
 	}
 
 	wasHealthy := h.healthy.Swap(allHealthy)

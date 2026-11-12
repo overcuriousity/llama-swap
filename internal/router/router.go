@@ -6,13 +6,13 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 var (
-	ErrNoRouterFound     = shared.ErrNoRouterFound
-	ErrNoPeerModelFound  = shared.ErrNoPeerModelFound
-	ErrNoLocalModelFound = shared.ErrNoLocalModelFound
+	ErrNoRouterFound     = swaputil.ErrNoRouterFound
+	ErrNoPeerModelFound  = swaputil.ErrNoPeerModelFound
+	ErrNoLocalModelFound = swaputil.ErrNoLocalModelFound
 )
 
 type Router interface {
@@ -41,6 +41,10 @@ type LocalRouter interface {
 	// stopped or shut down, keyed by model ID.
 	RunningModels() map[string]process.ProcessState
 
+	// RunningStatus is RunningModels with each model's ready time, read
+	// together with its state so the two never disagree.
+	RunningStatus() map[string]process.Status
+
 	// Unload stops the named models, or every running model when none are
 	// named. It blocks until each targeted process has stopped. A timeout <= 0
 	// gives each process its configured unloadTimeout to stop gracefully:
@@ -57,4 +61,8 @@ type LocalRouter interface {
 	// RPCHealthy reports whether the named model's configured RPC backends are
 	// reachable. Models without rpcHealthCheck enabled are always healthy.
 	RPCHealthy(modelID string) bool
+	// SetStartGate installs a check that runs before the router starts any
+	// process. While it returns an error no model starts, and the requests
+	// that needed one get that error.
+	SetStartGate(gate func() error)
 }

@@ -4,12 +4,20 @@ on:
   push:
     branches: ["main"]
     # only run when backend source changes
-    # cmd/ is excluded because it contains utilities without tests
+    # cmd/ is excluded because it contains utilities without tests;
+    # cmd/kubeswap is re-included: it has test suites (make test-cmd)
+    # and the Helm chart (make test-chart)
     paths:
       - "**/*.go"
       - "!cmd/**"
+      - "cmd/kubeswap/**"
       - "go.mod"
       - "go.sum"
+      # copied into docs/ by go generate; TestDocs_GeneratedFilesAreCurrent
+      - "config-schema.json"
+      - "ui/src/lib/prompts/docsAgent.ts"
+      - "docs/config-schema.json"
+      - "docs/docs-agent-prompt.md"
       - "Makefile"
       - ".github/workflows/go-ci.yml"
 
@@ -18,8 +26,14 @@ on:
     paths:
       - "**/*.go"
       - "!cmd/**"
+      - "cmd/kubeswap/**"
       - "go.mod"
       - "go.sum"
+      # copied into docs/ by go generate; TestDocs_GeneratedFilesAreCurrent
+      - "config-schema.json"
+      - "ui/src/lib/prompts/docsAgent.ts"
+      - "docs/config-schema.json"
+      - "docs/docs-agent-prompt.md"
       - "Makefile"
       - ".github/workflows/go-ci.yml"
 
@@ -68,3 +82,19 @@ jobs:
 
       - name: Test all
         run: make test-all
+
+      # The cmd utility suites are unix-only (vllm-wrapper uses
+      # syscall.Kill), so they run here (Linux) and not in the Windows
+      # CI, which only runs make test-all (internal).
+      - name: Test cmd utilities
+        run: make test-cmd
+
+      # Lint + render the kubeswap Helm chart (helm ships on the runner;
+      # the fallback keeps the step working if a future image drops it).
+      - name: Test chart
+        run: |
+          if ! command -v helm >/dev/null; then
+            curl -fsSL https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz \
+              | sudo tar xz --strip-components=1 -C /usr/local/bin
+          fi
+          make test-chart

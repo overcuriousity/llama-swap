@@ -101,3 +101,47 @@ func waitForRPCHealth(t *testing.T, p *ProcessCommand, want bool) {
 	}
 	t.Fatalf("IsRPCHealthy() = %v, want %v", p.IsRPCHealthy(), want)
 }
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+func TestProcessCommand_RPCHealthTimeoutKeepsState(t *testing.T) {
+	p := newRPCTestProcess(t, config.ModelConfig{Cmd: "llama-server -ngl 99"})
+	refused := fmt.Errorf("connection refused")
+
+	results := map[string]error{"a:1": nil, "b:1": nil}
+	h := &rpcHealth{
+		endpoints: []string{"a:1", "b:1"},
+		dial:      func(ep string) error { return results[ep] },
+	}
+
+	// An endpoint that has never answered must not turn healthy by timing out.
+	results["b:1"] = timeoutErr{}
+	p.checkRPCHealth(h)
+	if h.healthy.Load() {
+		t.Fatal("timeout on first check reported healthy")
+	}
+
+	results["b:1"] = nil
+	p.checkRPCHealth(h)
+	if !h.healthy.Load() {
+		t.Fatal("all endpoints reachable but reported unhealthy")
+	}
+
+	// A transient stall on a healthy model leaves it healthy.
+	results["a:1"] = timeoutErr{}
+	p.checkRPCHealth(h)
+	if !h.healthy.Load() {
+		t.Fatal("timeout flipped a healthy model to unhealthy")
+	}
+
+	// A hard failure wins over a timeout on another endpoint.
+	results["b:1"] = refused
+	p.checkRPCHealth(h)
+	if h.healthy.Load() {
+		t.Fatal("refused endpoint reported healthy")
+	}
+}

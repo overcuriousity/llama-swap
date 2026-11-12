@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,14 +18,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/docs"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools/sourcecode"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
-	"github.com/mostlygeek/llama-swap/internal/shared"
-	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/internal/tailcat"
 	"github.com/mostlygeek/llama-swap/internal/watcher"
 )
 
@@ -72,11 +79,65 @@ var logTimeFormats = map[string]string{
 	"stampnano":   time.StampNano,
 }
 
-func configStorePath(cfg config.Config) string {
+// storePaths are the database files a store is opened with. An empty path
+// is an in-memory database. A reload reopens the store only when they change.
+type storePaths struct {
+	activity string
+	captures string
+}
+
+func configStorePaths(cfg config.Config) storePaths {
 	if cfg.Store == nil {
-		return ""
+		return storePaths{}
 	}
-	return strings.TrimSpace(cfg.Store.Path)
+	return storePaths{
+		activity: strings.TrimSpace(cfg.Store.Path),
+		captures: cfg.Store.CapturesPath(),
+	}
+}
+
+func openStore(paths storePaths) (*sqlite.Store, error) {
+	return sqlite.New(paths.activity, paths.captures)
+}
+
+func configureTailcatListener(cfg *config.Config, keyPath string) error {
+	enabled := keyPath != ""
+	cfg.SetTailcatEnabled(enabled)
+	if !enabled {
+		return nil
+	}
+	if cfg.Tailcat == nil || len(cfg.Tailcat.Models) == 0 {
+		return fmt.Errorf("-listen-tailcat requires tailcat.models to define at least one exposed model")
+	}
+	if len(cfg.Tailcat.Allow) == 0 {
+		slog.Warn(`tailcat.allow is empty: every Tailcat client will get 403 Forbidden; add client node keys, or "*" to allow any client`)
+	}
+	return nil
+}
+
+func loadTailcatListenerKey(keyPath string, enabled bool) (*tailcat.PrivateKey, error) {
+	if !enabled {
+		return nil, nil
+	}
+	privateKey, err := tailcat.LoadPrivateKey(keyPath, true)
+	if err != nil {
+		return nil, fmt.Errorf("load -listen-tailcat key: %w", err)
+	}
+	return privateKey, nil
+}
+
+// runValidate loads the configuration from the given sources and prints a
+// short human-readable result to out. It returns 0 when the config loads
+// without error and 1 otherwise. It does not start the server, detect
+// hardware, or open a listener.
+func runValidate(configPath, configDir string, out io.Writer) int {
+	cfg, err := config.LoadConfigSources(configPath, configDir)
+	if err != nil {
+		fmt.Fprintf(out, "config validation failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "config is valid: %d model(s), %d peer(s)\n", len(cfg.Models), len(cfg.Peers))
+	return 0
 }
 
 func main() {
@@ -85,8 +146,10 @@ func main() {
 	flagListen := flag.String("listen", "", "listen address (default :8080 or :8443 for TLS)")
 	flagCertFile := flag.String("tls-cert-file", "", "TLS certificate file")
 	flagKeyFile := flag.String("tls-key-file", "", "TLS key file")
+	flagListenTailcat := flag.String("listen-tailcat", "", "path to Tailcat server PrivateKey JSON file")
 	flagVersion := flag.Bool("version", false, "show version and exit")
 	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
+	flagValidate := flag.Bool("validate", false, "validate the config file and exit (without starting the server)")
 	flag.Parse()
 
 	if *flagVersion {
@@ -97,6 +160,11 @@ func main() {
 	if *flagConfig == "" && *flagConfigDir == "" {
 		slog.Error("at least one of -config or -config-dir must be provided")
 		os.Exit(1)
+	}
+
+	if *flagValidate {
+		code := runValidate(*flagConfig, *flagConfigDir, os.Stdout)
+		os.Exit(code)
 	}
 
 	useTLS := *flagCertFile != "" || *flagKeyFile != ""
@@ -119,11 +187,26 @@ func main() {
 		slog.Error("failed to load config", "config", *flagConfig, "config-dir", *flagConfigDir, "error", err)
 		os.Exit(1)
 	}
+	if err := configureTailcatListener(&cfg, *flagListenTailcat); err != nil {
+		slog.Error("invalid Tailcat listener configuration", "error", err)
+		os.Exit(1)
+	}
+	tailcatPrivateKey, err := loadTailcatListenerKey(*flagListenTailcat, cfg.TailcatEnabled())
+	if err != nil {
+		slog.Error("failed to load -listen-tailcat key", "error", err)
+		os.Exit(1)
+	}
 
-	// Loggers are wired per cfg.LogToStdout: proxy/upstream feed muxLog, which
-	// owns the combined history served by /logs. They outlive config reloads,
-	// so a LogToStdout change requires a restart to take effect.
-	muxLog, proxyLog, upstreamLog := server.NewLoggers(cfg.LogToStdout)
+	// Loggers are wired per cfg.LogToStdout: the selected streams feed
+	// logs.MuxLogs, which owns the combined history served by /logs. They
+	// outlive config reloads, so a LogToStdout change requires a restart to
+	// take effect.
+	logs, err := server.NewLoggers(cfg.LogToStdout)
+	if err != nil {
+		slog.Error("failed to create loggers", "error", err)
+		os.Exit(1)
+	}
+	proxyLog := logs.ProxyLogs
 
 	applyLogSettings := func(cfg config.Config) {
 		level := logmon.LevelInfo
@@ -136,14 +219,25 @@ func main() {
 			level = logmon.LevelError
 		}
 		timeFormat := logTimeFormats[strings.ToLower(strings.TrimSpace(cfg.LogTimeFormat))]
-		for _, lg := range []*logmon.Monitor{proxyLog, upstreamLog} {
-			lg.SetLogLevel(level)
-			lg.SetLogTimeFormat(timeFormat)
-		}
+		logs.SetLogLevel(level)
+		logs.SetLogTimeFormat(timeFormat)
 	}
 
 	applyLogSettings(cfg)
 	proxyLog.Debugf("PID: %d", os.Getpid())
+
+	// Hardware describes the inference host and remains stable for the life of
+	// this process, including config reloads. Detection is best effort so an
+	// unavailable platform probe never prevents llama-swap from starting.
+	var hardwareSnapshot *hw.HardwareSnapshot
+	detectCtx, detectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	detectedHardware, detectErr := hw.Detect(detectCtx, version)
+	detectCancel()
+	if detectErr != nil {
+		proxyLog.Warnf("hardware detection unavailable: %v", detectErr)
+	} else {
+		hardwareSnapshot = &detectedHardware
+	}
 
 	// On Windows, bind the process tree to a Job Object so every upstream
 	// process is reaped when llama-swap exits — even on a forced kill. No-op
@@ -167,14 +261,30 @@ func main() {
 
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
 
-	initialStorePath := configStorePath(cfg)
-	initialStore, err := store.New(initialStorePath)
+	// Indexed once and shared by every Server instance, including the ones a
+	// hot config reload creates: the documentation is immutable and does not
+	// depend on cfg.
+	referenceDocs := docagent.NewWithSchema(docs.Files, docs.ConfigSchema)
+
+	// Shared the same way. The source behind the code__* MCP tools is
+	// embedded only in builds with the embed_src tag.
+	sourceCode := sourcecode.NewProvider(sourcecode.Options{
+		Source: sourcecode.Embedded,
+		Ref:    sourcecode.RefForVersion(version),
+	})
+
+	// Shared the same way, so a config reload while inference is paused
+	// keeps it paused (issue #1268).
+	pauseState := server.NewPauseState()
+
+	initialStorePaths := configStorePaths(cfg)
+	initialStore, err := openStore(initialStorePaths)
 	if err != nil {
 		slog.Error("failed to create store", "error", err)
 		os.Exit(1)
 	}
 
-	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, initialStore, buildInfo)
+	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		initialStore.Close()
@@ -183,7 +293,8 @@ func main() {
 
 	// configSource enables the UI config editor. It stays empty when started
 	// without a config file, which leaves the editor endpoints disabled.
-	configSource := server.ConfigSource{Example: GetConfigExampleYAML()}
+	example, _ := fs.ReadFile(docs.Files, "config.example.yaml")
+	configSource := server.ConfigSource{Example: example}
 	if *flagConfig != "" {
 		configSource.Path = *flagConfig
 	}
@@ -193,7 +304,44 @@ func main() {
 	var activeMu sync.RWMutex
 	activeSrv := initialSrv
 	activeStore := initialStore
-	activeStorePath := initialStorePath
+	activeStorePaths := initialStorePaths
+
+	tailcatHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activeMu.RLock()
+		srv := activeSrv
+		activeMu.RUnlock()
+		srv.ServeTailcatHTTP(w, r)
+	})
+	tailcatLogger := func(cfg config.Config) tailcat.Logger {
+		if cfg.Tailcat != nil && cfg.Tailcat.Debug {
+			return proxyLog
+		}
+		return nil
+	}
+	startTailcat := func(cfg config.Config) (*tailcat.Server, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		return tailcat.Start(ctx, tailcat.ServerOptions{
+			PrivateKey: tailcatPrivateKey,
+			Handler:    tailcatHandler,
+			Logger:     tailcatLogger(cfg),
+		})
+	}
+
+	var activeTailcat *tailcat.Server
+	if cfg.TailcatEnabled() {
+		activeTailcat, err = startTailcat(cfg)
+		if err != nil {
+			slog.Error("failed to start Tailcat server", "error", err)
+			initialSrv.Shutdown(shutdownTimeout)
+			initialStore.Close()
+			os.Exit(1)
+		}
+	}
+	if activeTailcat != nil {
+		initialSrv.SetTailcatAddress(activeTailcat.Address())
+		proxyLog.Infof("Tailcat listening on virtual TCP port 80: %s", activeTailcat.Address())
+	}
 
 	httpServer := &http.Server{
 		Addr: listenAddr,
@@ -231,28 +379,29 @@ func main() {
 			proxyLog.Warnf("failed to reload config: %v", err)
 			return
 		}
-
-		if perfMon != nil {
-			perfMon.UpdateConfig(newCfg.Performance)
+		if err := configureTailcatListener(&newCfg, *flagListenTailcat); err != nil {
+			proxyLog.Warnf("failed to reload config: %v", err)
+			return
 		}
 
-		newStorePath := configStorePath(newCfg)
+		newStorePaths := configStorePaths(newCfg)
 		activeMu.RLock()
 		currentStore := activeStore
-		currentStorePath := activeStorePath
+		currentStorePaths := activeStorePaths
+		currentTailcat := activeTailcat
 		activeMu.RUnlock()
 
 		newStore := currentStore
-		storeChanged := newStorePath != currentStorePath
+		storeChanged := newStorePaths != currentStorePaths
 		if storeChanged {
-			newStore, err = store.New(newStorePath)
+			newStore, err = openStore(newStorePaths)
 			if err != nil {
 				proxyLog.Warnf("failed to create new store during reload: %v", err)
 				return
 			}
 		}
 
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo)
+		newSrv, err := server.New(newCfg, logs, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			if storeChanged {
@@ -262,15 +411,26 @@ func main() {
 		}
 		newSrv.SetConfigSource(configSource)
 
+		if currentTailcat != nil {
+			newSrv.SetTailcatAddress(currentTailcat.Address())
+			// The listener is never restarted: connected Tailcat clients do not
+			// reconnect to a restarted server. tailcat.allow is enforced by
+			// newSrv per request; only the debug logger needs updating here.
+			currentTailcat.SetLogger(tailcatLogger(newCfg))
+		}
+
 		activeMu.Lock()
 		old := activeSrv
 		oldStore := activeStore
 		activeSrv = newSrv
 		activeStore = newStore
-		activeStorePath = newStorePath
+		activeStorePaths = newStorePaths
 		activeMu.Unlock()
 
 		applyLogSettings(newCfg)
+		if perfMon != nil {
+			perfMon.UpdateConfig(newCfg.Performance)
+		}
 
 		if err := old.Shutdown(shutdownTimeout); err != nil {
 			proxyLog.Warnf("error shutting down old server during reload: %v", err)
@@ -283,7 +443,7 @@ func main() {
 
 		// Notify UI after a short delay so it can refresh model state.
 		time.AfterFunc(3*time.Second, func() {
-			event.Emit(shared.ConfigFileChangedEvent{State: shared.ReloadingStateEnd})
+			event.Emit(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateEnd})
 		})
 
 		proxyLog.Info("configuration reloaded")
@@ -293,8 +453,8 @@ func main() {
 
 	// Reload on config written through the UI editor, independent of
 	// --watch-config: the editor's own POST is the change signal.
-	defer event.On(func(e shared.ConfigFileChangedEvent) {
-		if e.State == shared.ReloadingStateStart {
+	defer event.On(func(e swaputil.ConfigFileChangedEvent) {
+		if e.State == swaputil.ReloadingStateStart {
 			debouncedReload()
 		}
 	})()
@@ -354,7 +514,7 @@ func main() {
 		}
 	}()
 
-	if !shared.IsLoopbackAddr(listenAddr) {
+	if !swaputil.IsLoopbackAddr(listenAddr) {
 		_, port, _ := net.SplitHostPort(listenAddr)
 		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
 	}
@@ -385,6 +545,7 @@ func main() {
 				activeMu.RLock()
 				srv := activeSrv
 				st := activeStore
+				tailcatRuntime := activeTailcat
 				activeMu.RUnlock()
 
 				// Close long-lived SSE streams first so httpServer.Shutdown can
@@ -398,6 +559,11 @@ func main() {
 				defer cancel()
 				if err := httpServer.Shutdown(shutdownCtx); err != nil {
 					proxyLog.Warnf("http server shutdown error: %v", err)
+				}
+				if tailcatRuntime != nil {
+					if err := tailcatRuntime.Close(shutdownCtx); err != nil {
+						proxyLog.Warnf("Tailcat server shutdown error: %v", err)
+					}
 				}
 
 				// Clamp the remaining budget to a small positive value: a

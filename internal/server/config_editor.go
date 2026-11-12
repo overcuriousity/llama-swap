@@ -11,7 +11,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // maxConfigUploadBytes bounds the config document accepted by the editor so a
@@ -44,7 +44,7 @@ func (s *Server) handleAPIConfigCurrent(w http.ResponseWriter, r *http.Request) 
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		s.proxylog.Errorf("config editor: failed to read %s: %v", path, err)
+		s.logs.ProxyLogs.Errorf("config editor: failed to read %s: %v", path, err)
 		http.Error(w, "llama-swap-error: failed to read config file", http.StatusInternalServerError)
 		return
 	}
@@ -92,12 +92,12 @@ func (s *Server) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	// Write via a temp file in the same directory and rename, so a crash or a
 	// concurrent reader never observes a half-written config.
 	if err := writeFileAtomic(path, body); err != nil {
-		s.proxylog.Errorf("config editor: failed to write %s: %v", path, err)
+		s.logs.ProxyLogs.Errorf("config editor: failed to write %s: %v", path, err)
 		http.Error(w, "llama-swap-error: failed to write config file", http.StatusInternalServerError)
 		return
 	}
 
-	event.Emit(shared.ConfigFileChangedEvent{State: shared.ReloadingStateStart})
+	event.Emit(swaputil.ConfigFileChangedEvent{State: swaputil.ReloadingStateStart})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

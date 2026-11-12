@@ -9,76 +9,94 @@ import (
 )
 
 const (
-	MODEL_CONFIG_DEFAULT_TTL = -1
+	MODEL_CONFIG_DEFAULT_TTL   = -1
+	MODEL_CONFIG_DEFAULT_PROXY = "http://localhost:${PORT}"
+	comfyUIConcurrencyLimit    = 999
+
+	// ComfyUIModelID identifies the model used by the /comfyui endpoint.
+	ComfyUIModelID = "comfyui_auto"
+
+	// AudioCppModelID identifies the model used by the /audiocpp endpoint.
+	AudioCppModelID = "audiocpp_auto"
 )
 
 var validModalities = map[string]struct{}{
 	"text":  {},
 	"audio": {},
 	"image": {},
+	"video": {},
+}
+
+// validOutModalities adds "decisions", the only output of llama.cpp decision
+// models, which answer /v1/systemone and generate no text.
+var validOutModalities = map[string]struct{}{
+	"text":      {},
+	"audio":     {},
+	"image":     {},
+	"video":     {},
+	"decisions": {},
 }
 
 // ModelCapConfig defines what modalities and features a model supports.
 // Used in /v1/models to inform clients. An empty block (all zero values) is
 // treated as not configured.
-//
-// The custom UnmarshalYAML stores an untyped representation so YAML anchors
-// can be resolved before macro substitution. After ResolveMacros is called
-// the typed fields (In, Out, Tools, Reranker, Context) are populated.
 type ModelCapConfig struct {
-	In       []string `yaml:"in"`
-	Out      []string `yaml:"out"`
-	Tools    bool     `yaml:"tools"`
-	Reranker bool     `yaml:"reranker"`
-	Context  int      `yaml:"context"`
+	In         []string `yaml:"in" json:"in,omitempty"`
+	Out        []string `yaml:"out" json:"out,omitempty"`
+	Tools      bool     `yaml:"tools" json:"tools,omitempty"`
+	Reranker   bool     `yaml:"reranker" json:"reranker,omitempty"`
+	Embeddings bool     `yaml:"embeddings" json:"embeddings,omitempty"`
+	Context    int      `yaml:"context" json:"context,omitempty"`
 
-	raw map[string]any
+	// Voices, when set, is returned as the response to
+	// GET /v1/audio/voices?model={id} instead of asking the upstream. It is
+	// never discovered and never rendered into /v1/models, so Empty and Merge
+	// leave it alone.
+	Voices []string `yaml:"voices" json:"-"`
+
+	// DisableAuto turns off automatic capability discovery for this model.
+	// It is a switch, not a capability, so Empty ignores it and it is never
+	// rendered into /v1/models.
+	DisableAuto bool `yaml:"disableAuto" json:"-"`
 }
 
-// UnmarshalYAML decodes capabilities into an untyped map. This materializes
-// YAML aliases and merge keys while allowing macro placeholders in fields
-// that will ultimately be decoded as ints or bools.
-func (c *ModelCapConfig) UnmarshalYAML(value *yaml.Node) error {
-	return value.Decode(&c.raw)
-}
-
-// ResolveMacros substitutes all macros in the untyped representation (LIFO
-// order matching LoadConfigFromReader), then decodes the resolved values into
-// the typed fields.
-func (c *ModelCapConfig) ResolveMacros(macros MacroList) error {
-	if c.raw == nil {
-		return c.Validate()
-	}
-
-	var resolved any = c.raw
-	for i := len(macros) - 1; i >= 0; i-- {
-		entry := macros[i]
-		var err error
-		resolved, err = substituteMacroInValue(resolved, entry.Name, entry.Value)
-		if err != nil {
-			return fmt.Errorf("capabilities: failed macro substitution: %w", err)
-		}
-	}
-	if err := validateNestedForUnknownMacros(resolved, "capabilities"); err != nil {
-		return err
-	}
-
-	var node yaml.Node
-	if err := node.Encode(resolved); err != nil {
-		return fmt.Errorf("capabilities: failed to encode after macro substitution: %w", err)
-	}
-	*c = ModelCapConfig{}
-	type rawCap ModelCapConfig
-	if err := node.Decode((*rawCap)(c)); err != nil {
-		return fmt.Errorf("capabilities: failed to decode after macro substitution: %w", err)
-	}
-
-	return c.Validate()
-}
-
-// Empty returns true when all fields are at their zero values.
+// Empty returns true when all capability fields are at their zero values.
+// DisableAuto is deliberately excluded: a block that only turns discovery off
+// still advertises nothing, so it must render as if it were absent.
 func (c ModelCapConfig) Empty() bool {
-	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && c.Context == 0
+	return len(c.In) == 0 && len(c.Out) == 0 && !c.Tools && !c.Reranker && !c.Embeddings && c.Context == 0
+}
+
+// Merge returns c with every field left at its zero value filled in from
+// auto. Configured values always win, field by field, so a model that sets
+// only capabilities.tools still picks up a discovered context length.
+//
+// A field explicitly set to its zero value in the config is indistinguishable
+// from an omitted one, so `tools: false` cannot override a discovered true.
+// Use capabilities.disableAuto to suppress discovery for the model instead.
+//
+// DisableAuto is carried over from c unchanged; auto never sets it.
+func (c ModelCapConfig) Merge(auto ModelCapConfig) ModelCapConfig {
+	merged := c
+	if len(merged.In) == 0 {
+		merged.In = auto.In
+	}
+	if len(merged.Out) == 0 {
+		merged.Out = auto.Out
+	}
+	if !merged.Tools {
+		merged.Tools = auto.Tools
+	}
+	if !merged.Reranker {
+		merged.Reranker = auto.Reranker
+	}
+	if !merged.Embeddings {
+		merged.Embeddings = auto.Embeddings
+	}
+	if merged.Context == 0 {
+		merged.Context = auto.Context
+	}
+	return merged
 }
 
 // Validate checks that all modality values are recognized and context is
@@ -86,12 +104,12 @@ func (c ModelCapConfig) Empty() bool {
 func (c ModelCapConfig) Validate() error {
 	for _, m := range c.In {
 		if _, ok := validModalities[m]; !ok {
-			return fmt.Errorf("capabilities.in: invalid modality %q, must be one of: text, audio, image", m)
+			return fmt.Errorf("capabilities.in: invalid modality %q, must be one of: text, audio, image, video", m)
 		}
 	}
 	for _, m := range c.Out {
-		if _, ok := validModalities[m]; !ok {
-			return fmt.Errorf("capabilities.out: invalid modality %q, must be one of: text, audio, image", m)
+		if _, ok := validOutModalities[m]; !ok {
+			return fmt.Errorf("capabilities.out: invalid modality %q, must be one of: text, audio, image, video, decisions", m)
 		}
 	}
 	if c.Context < 0 {
@@ -111,6 +129,13 @@ type TimeoutsConfig struct {
 	IdleConn       int `yaml:"idleConn"`
 }
 
+// CompatConfig holds compatibility settings for upstream applications.
+type CompatConfig struct {
+	// IgnoreWebsockets prevents websocket connections from participating in
+	// model lifecycle activity such as swapping, concurrency, and TTL tracking.
+	IgnoreWebsockets bool `yaml:"ignoreWebsockets"`
+}
+
 type ModelConfig struct {
 	Cmd           string   `yaml:"cmd"`
 	CmdStop       string   `yaml:"cmdStop"`
@@ -122,6 +147,11 @@ type ModelConfig struct {
 	UnloadTimeout int      `yaml:"unloadTimeout"`
 	Unlisted      bool     `yaml:"unlisted"`
 	UseModelName  string   `yaml:"useModelName"`
+
+	// Capacities declares resource usage for the capacity router. Missing pools
+	// consume zero; higher EvictCost favors keeping this model resident.
+	Capacities map[string]int64 `yaml:"capacities"`
+	EvictCost  int64            `yaml:"evict_cost"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
@@ -147,6 +177,14 @@ type ModelConfig struct {
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
 
+	// DisableKeepAlives opens a new upstream connection for every request
+	// instead of reusing pooled ones. Works around upstreams that advertise
+	// keep-alive and then close the connection (#1205).
+	DisableKeepAlives bool `yaml:"disableKeepAlives"`
+
+	// Compatibility settings for upstream applications.
+	Compat CompatConfig `yaml:"compat"`
+
 	// Capabilities defines what modalities and features the model supports.
 	Capabilities ModelCapConfig `yaml:"capabilities"`
 
@@ -161,12 +199,14 @@ type ModelConfig struct {
 	RequestTimeout int `yaml:"requestTimeout"`
 }
 
-func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+// UnmarshalYAML applies model defaults and checks capacity values before YAML
+// numeric conversions can truncate fractional requirements or eviction costs.
+func (m *ModelConfig) UnmarshalYAML(node *yaml.Node) error {
 	type rawModelConfig ModelConfig
 	defaults := rawModelConfig{
 		Cmd:              "",
 		CmdStop:          "",
-		Proxy:            "http://localhost:${PORT}",
+		Proxy:            MODEL_CONFIG_DEFAULT_PROXY,
 		Aliases:          []string{},
 		Env:              []string{},
 		CheckEndpoint:    "/health",
@@ -196,7 +236,18 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		defaults.CmdStop = "taskkill /f /t /pid ${PID}"
 	}
 
-	if err := unmarshal(&defaults); err != nil {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if key == "capacities" {
+			if err := validateCapacityMap(value, "capacities"); err != nil {
+				return err
+			}
+		}
+		if key == "evict_cost" && value.Tag != "!!int" {
+			return fmt.Errorf("evict_cost must be an integer")
+		}
+	}
+	if err := node.Decode(&defaults); err != nil {
 		return err
 	}
 

@@ -1,16 +1,21 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
-// ReqRespCapture is a stored request/response pair for a single metered request.
+// ReqRespCapture is a stored request/response pair for a single metered
+// request. ID is the activity row's ID.
 type ReqRespCapture struct {
 	ID          int               `json:"id"`
 	ReqPath     string            `json:"req_path"`
@@ -57,25 +62,50 @@ func captureFieldsFor(path string) captureFields {
 	return captureAll
 }
 
-// zstdEncOptions are the shared zstd encoder options for maximum compression.
+// zstdConcurrency bounds how many captures compress (or decompress) at once.
+// Each in-flight EncodeAll holds one sub-encoder, so this is also the number
+// of sub-encoders the shared encoder allocates.
+var zstdConcurrency = max(1, min(runtime.GOMAXPROCS(0), 4))
+
+// zstdEncOptions are the shared zstd encoder options.
+//
+// Memory retained by a sub-encoder is dominated by its match tables (~4 MiB at
+// SpeedBetterCompression) and a history buffer of twice the window size. The
+// library defaults create GOMAXPROCS sub-encoders with an 8 MiB window, so a
+// single encoder retained ~20 MiB per core once every sub-encoder had been
+// used (#1106). Captures are mostly JSON bodies of a few MB at most, which a
+// 1 MiB window compresses just as well.
 var zstdEncOptions = []zstd.EOption{
 	zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+	zstd.WithEncoderConcurrency(zstdConcurrency),
+	zstd.WithWindowSize(1 << 20),
 }
 
-// zstdEncPool pools zstd.Encoder instances to reduce allocations.
-var zstdEncPool = &sync.Pool{
-	New: func() interface{} {
-		enc, _ := zstd.NewWriter(nil, zstdEncOptions...)
-		return enc
-	},
+// zstdEnc is the shared capture encoder. EncodeAll is safe for concurrent use
+// and blocks while every sub-encoder is busy, which caps compression memory
+// at zstdConcurrency sub-encoders (~6 MiB each) regardless of how many
+// requests finish at once. A sync.Pool of encoders instead grew to one
+// encoder per peak concurrent request and held them until the GC drained it.
+var zstdEnc = mustZstdEncoder()
+
+// zstdDec is the shared capture decoder. DecodeAll is safe for concurrent use
+// and bounded by the decoder concurrency the same way.
+var zstdDec = mustZstdDecoder()
+
+func mustZstdEncoder() *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil, zstdEncOptions...)
+	if err != nil {
+		panic(fmt.Sprintf("capture zstd encoder: %v", err))
+	}
+	return enc
 }
 
-// zstdDecPool pools zstd.Decoder instances to reduce allocations.
-var zstdDecPool = &sync.Pool{
-	New: func() interface{} {
-		dec, _ := zstd.NewReader(nil)
-		return dec
-	},
+func mustZstdDecoder() *zstd.Decoder {
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(zstdConcurrency))
+	if err != nil {
+		panic(fmt.Sprintf("capture zstd decoder: %v", err))
+	}
+	return dec
 }
 
 // compressCapture marshals a ReqRespCapture to CBOR and compresses it with zstd.
@@ -85,16 +115,12 @@ func compressCapture(c *ReqRespCapture) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("marshal capture: %w", err)
 	}
-	zenc := zstdEncPool.Get().(*zstd.Encoder)
-	defer zstdEncPool.Put(zenc)
-	return zenc.EncodeAll(cborBytes, nil), len(cborBytes), nil
+	return zstdEnc.EncodeAll(cborBytes, nil), len(cborBytes), nil
 }
 
 // decompressCapture decompresses zstd-compressed CBOR into a ReqRespCapture.
 func decompressCapture(data []byte) (*ReqRespCapture, error) {
-	dec := zstdDecPool.Get().(*zstd.Decoder)
-	defer zstdDecPool.Put(dec)
-	cborBytes, err := dec.DecodeAll(data, nil)
+	cborBytes, err := zstdDec.DecodeAll(data, nil)
 	if err != nil {
 		return nil, fmt.Errorf("decompress capture: %w", err)
 	}
@@ -105,9 +131,10 @@ func decompressCapture(data []byte) (*ReqRespCapture, error) {
 	return &capture, nil
 }
 
-// addCapture compresses and stores a capture in the cache. Returns true if the
-// capture was stored.
-func (mp *metricsMonitor) addCapture(capture ReqRespCapture) bool {
+// addCapture compresses a capture and stores it under captureID, then asks the
+// background pruner to delete the oldest captures if the total is now over
+// the capture size limit. Returns true if the capture was stored.
+func (mp *metricsMonitor) addCapture(captureID string, capture ReqRespCapture) bool {
 	if !mp.enableCaptures {
 		return false
 	}
@@ -118,29 +145,53 @@ func (mp *metricsMonitor) addCapture(capture ReqRespCapture) bool {
 		return false
 	}
 
-	if err := mp.captureCache.Add(capture.ID, compressed); err != nil {
-		mp.logger.Warnf("capture %d too large (%d bytes), skipping: %v", capture.ID, len(compressed), err)
+	// captureBuffer limits compressed bytes, the size actually stored.
+	if int64(len(compressed)) > mp.maxCaptureBytes {
+		mp.logger.Warnf("capture %s too large (%d bytes), skipping: exceeds captureBuffer of %d bytes", captureID, len(compressed), mp.maxCaptureBytes)
 		return false
 	}
 
+	// Like queueMetrics, this runs after the handler returned, so it does not
+	// use the request context.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	captures := mp.store.Captures()
+	if err := captures.Put(ctx, store.CaptureEntry{
+		ID:                captureID,
+		Data:              compressed,
+		UncompressedBytes: int64(uncompressedBytes),
+	}); err != nil {
+		mp.logger.Warnf("failed to store capture %s: %v", captureID, err)
+		return false
+	}
+	mp.requestCapturePrune()
+
 	compressionRatio := (1 - float64(len(compressed))/float64(uncompressedBytes)) * 100
-	mp.logger.Debugf("Capture %d compressed and saved: %d bytes -> %d bytes (%.1f%% compression)", capture.ID, uncompressedBytes, len(compressed), compressionRatio)
+	mp.logger.Debugf("Capture %s compressed and saved: %d bytes -> %d bytes (%.1f%% compression)", captureID, uncompressedBytes, len(compressed), compressionRatio)
 	return true
 }
 
-// getCaptureByID decompresses and unmarshals a capture by ID. Returns nil if
-// the capture is not found or decompression fails.
-func (mp *metricsMonitor) getCaptureByID(id int) *ReqRespCapture {
-	if mp.captureCache == nil {
+// getCaptureByID decompresses and unmarshals a capture by capture ID. Returns
+// nil if captures are disabled, the capture is not found, or decompression
+// fails.
+func (mp *metricsMonitor) getCaptureByID(id string) *ReqRespCapture {
+	if !mp.enableCaptures {
 		return nil
 	}
-	data, err := mp.captureCache.Get(id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entry, found, err := mp.store.Captures().Get(ctx, id)
 	if err != nil {
+		mp.logger.Warnf("failed to read capture %s: %v", id, err)
 		return nil
 	}
-	capture, err := decompressCapture(data)
+	if !found {
+		return nil
+	}
+	capture, err := decompressCapture(entry.Data)
 	if err != nil {
-		mp.logger.Warnf("failed to decompress capture %d: %v", id, err)
+		mp.logger.Warnf("failed to decompress capture %s: %v", id, err)
 		return nil
 	}
 	return capture

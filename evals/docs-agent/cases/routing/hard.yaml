@@ -1,0 +1,75 @@
+- id: hard-group-swap-semantics
+  question: A group has swap true and exclusive false. I request a second member of that group. What happens to the first?
+  tags: [routing, trap]
+  expect_any: ["unload", "evict", "stop"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    It is unloaded. swap: true means only one member of the group runs at a
+    time. exclusive: false only affects other groups, which are left alone.
+  rubric:
+    - Says the first member is unloaded
+    - Attributes it to swap true governing members among themselves
+    - Notes exclusive false means other groups are unaffected
+
+- id: hard-matrix-operators
+  question: In a llama-swap matrix set expression, what do the & and | operators mean?
+  tags: [routing, multihop]
+  expect_regex: ["&", "\\|"]
+  expect_any: ["and", "or"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    `&` is AND -- these models run together. `|` is OR -- alternatives.
+    Parentheses group, and `+name` inlines another set's expression.
+  rubric:
+    - Says & means the models run together (AND)
+    - Says | means alternatives (OR)
+
+- id: hard-capacity-measures-nothing
+  question: Does the capacity router measure how much VRAM my models actually use?
+  tags: [routing, capacity, trap]
+  expect_any: ["\\bno\\b", "does not", "doesn't", "not"]
+  expect_regex: ["declare|configure|your"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    No. It does not measure usage or assign GPUs. It only compares the
+    `capacities` you declare against the pool limits you declare, so include
+    context and backend overhead.
+  rubric:
+    - Answers no
+    - Says the numbers are declared by the user
+
+- id: hard-capacity-eviction-choice
+  question: "Capacity router, one pool ram: 20000. Running: alpha (10000, evict_cost 100), bravo (5000, evict_cost 1), charlie (5000, evict_cost 1). I request delta, which needs 10000. Which models get evicted?"
+  tags: [routing, capacity, multihop]
+  expect_regex: ["bravo", "charlie"]
+  expect_any: ["cost"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    bravo and charlie. Evicting both frees the 10000 delta needs at a summed
+    evict_cost of 2, against 100 for evicting alpha.
+  rubric:
+    - Says bravo and charlie are evicted and alpha stays
+    - Explains the lowest summed evict_cost wins
+
+- id: hard-global-limit-queues
+  question: When globalConcurrencyLimit is reached, do further requests wait in a queue?
+  tags: [routing, limits, trap]
+  expect_regex: ["429"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    No. They are rejected immediately with HTTP 429 rather than queued.
+  rubric:
+    - Says requests are rejected, not queued
+    - Gives HTTP 429
+
+- id: hard-matrix-orphans
+  question: In a matrix config, how do I include every model that none of my sets name, without listing them?
+  tags: [routing, matrix]
+  expect_regex: ["\\+auto:orphans"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    Reference `+auto:orphans` in a set expression. It includes each model that
+    is not a leaf in your sets.
+  rubric:
+    - Gives +auto:orphans
+    - Shows it in a set expression

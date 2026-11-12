@@ -10,8 +10,9 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // modelRecord is one entry in the OpenAI-compatible /v1/models listing.
@@ -26,18 +27,9 @@ type modelRecord struct {
 	Capabilities        map[string]any `json:"capabilities,omitempty"`
 	SupportedParameters []string       `json:"supported_parameters,omitempty"`
 	ContextLength       int            `json:"context_length,omitempty"`
+	ContextWindow       int            `json:"context_window,omitempty"`
 	Meta                map[string]any `json:"meta,omitempty"`
 	Status              map[string]any `json:"status"`
-}
-
-// cappedMetadataKeys are top-level /v1/models fields produced by the
-// capabilities renderer. If a model's metadata block defines any of these
-// keys, the renderer's values win and the metadata keys are dropped.
-var cappedMetadataKeys = map[string]struct{}{
-	"architecture":         {},
-	"capabilities":         {},
-	"supported_parameters": {},
-	"context_length":       {},
 }
 
 // renderCapabilities converts a model's capabilities config into additional
@@ -64,7 +56,7 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 	}
 
 	// Build capabilities map only if there's something to put in it.
-	if hasIn || hasOut || caps.Tools || caps.Reranker {
+	if hasIn || hasOut || caps.Tools || caps.Reranker || caps.Embeddings {
 		capsMap = make(map[string]any)
 	}
 
@@ -72,6 +64,9 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 		if contains(caps.In, "image") {
 			capsMap["vision"] = true
 		}
+	}
+	if hasOut && contains(caps.Out, "decisions") {
+		capsMap["decisions"] = true
 	}
 	if hasIn && hasOut {
 		if contains(caps.In, "audio") && contains(caps.Out, "text") {
@@ -97,6 +92,10 @@ func renderCapabilities(caps config.ModelCapConfig) (arch map[string]any, capsMa
 		capsMap["reranker"] = true
 	}
 
+	if caps.Embeddings {
+		capsMap["embeddings"] = true
+	}
+
 	if caps.Context > 0 {
 		ctxLen = caps.Context
 	}
@@ -114,28 +113,11 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-// filterCappedMetadata returns metadata with renderer-owned keys removed.
-func filterCappedMetadata(md map[string]any) map[string]any {
-	if len(md) == 0 {
-		return nil
-	}
-	filtered := make(map[string]any, len(md))
-	for k, v := range md {
-		if _, capped := cappedMetadataKeys[k]; !capped {
-			filtered[k] = v
-		}
-	}
-	if len(filtered) == 0 {
-		return nil
-	}
-	return filtered
-}
-
 // handleListModels serves the OpenAI-compatible model listing: local models
 // (with optional aliases) plus peer models.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
-	data := make([]modelRecord, 0, len(s.cfg.Models))
+	data := make([]modelRecord, 0, len(s.cfg.Models)+len(s.cfg.Selectors))
 	running := s.local.RunningModels()
 	modelIDs := make(map[string]struct{})
 
@@ -146,7 +128,13 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		return "unloaded"
 	}
 
-	newRecord := func(id, name, description string, metadata map[string]any, caps config.ModelCapConfig, status string) modelRecord {
+	newRecord := func(
+		id, name, description string,
+		metadata map[string]any,
+		caps config.ModelCapConfig,
+		status string,
+		internalMetadata map[string]any,
+	) modelRecord {
 		rec := modelRecord{
 			ID:          id,
 			Object:      "model",
@@ -157,11 +145,27 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			Status:      map[string]any{"value": status},
 		}
 		rec.Architecture, rec.Capabilities, rec.SupportedParameters, rec.ContextLength = renderCapabilities(caps)
-		if !caps.Empty() {
-			metadata = filterCappedMetadata(metadata)
+		// context_window mirrors context_length for OpenAI-compatible gateways
+		// (e.g. Bifrost) that read the context size from this field name.
+		rec.ContextWindow = rec.ContextLength
+		// Custom metadata is nested under meta.llamaswap, so its keys never
+		// collide with the top-level fields rendered from capabilities and is
+		// passed through as configured.
+		llamaSwapMetadata := make(map[string]any, len(metadata)+len(internalMetadata))
+		for key, value := range metadata {
+			llamaSwapMetadata[key] = value
 		}
-		if len(metadata) > 0 {
-			rec.Meta = map[string]any{"llamaswap": metadata}
+		for key, value := range internalMetadata {
+			llamaSwapMetadata[key] = value
+		}
+		if len(llamaSwapMetadata) > 0 || rec.ContextLength > 0 {
+			rec.Meta = make(map[string]any)
+			if len(llamaSwapMetadata) > 0 {
+				rec.Meta["llamaswap"] = llamaSwapMetadata
+			}
+			if rec.ContextLength > 0 {
+				rec.Meta["n_ctx"] = rec.ContextLength
+			}
 		}
 		return rec
 	}
@@ -179,17 +183,40 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		// Hide models whose RPC backends are down: listing them invites
 		// requests that can only fail once the backend is dialed.
 		if !s.local.RPCHealthy(id) {
-			s.proxylog.Debugf("<%s> filtered from /v1/models (unhealthy RPC)", id)
+			s.logs.ProxyLogs.Debugf("<%s> filtered from /v1/models (unhealthy RPC)", id)
 			continue
 		}
 
 		status := modelStatus(id)
-		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, status))
+		internalMetadata := map[string]any{"type": "model"}
+		if len(mc.Aliases) > 0 {
+			internalMetadata["aliases"] = mc.Aliases
+		}
+		// Resolved once and reused for the aliases, which describe the same
+		// upstream and must not disagree with the model they point at.
+		caps := s.resolveCapabilities(r.Context(), id, mc)
+		upstream := s.localUpstream(r.Context(), id, mc)
+		if upstream != hint.Unknown {
+			internalMetadata["upstream"] = string(upstream)
+		}
+		data = append(data, newRecord(id, mc.Name, mc.Description, mc.Metadata, caps, status, internalMetadata))
 
 		if s.cfg.IncludeAliasesInList {
 			for _, alias := range mc.Aliases {
 				if alias := strings.TrimSpace(alias); alias != "" {
-					data = append(data, newRecord(alias, mc.Name, mc.Description, mc.Metadata, mc.Capabilities, status))
+					aliasMetadata := map[string]any{"type": "alias", "modelID": id}
+					if upstream != hint.Unknown {
+						aliasMetadata["upstream"] = string(upstream)
+					}
+					data = append(data, newRecord(
+						alias,
+						mc.Name,
+						mc.Description,
+						mc.Metadata,
+						caps,
+						status,
+						aliasMetadata,
+					))
 				}
 			}
 		}
@@ -197,9 +224,59 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 	for peerID, peer := range s.cfg.Peers {
 		for _, modelID := range peer.Models {
-			modelIDs[modelID] = struct{}{}
-			data = append(data, newRecord(modelID, peerID+": "+modelID, "", map[string]any{"peerID": peerID}, config.ModelCapConfig{}, "unloaded"))
+			fqn := config.PeerModelFQN(peerID, modelID)
+			modelIDs[fqn] = struct{}{}
+			if resolvedPeer, resolvedModel, found := s.cfg.ResolvePeerModel(modelID); found &&
+				resolvedPeer == peerID && resolvedModel == modelID {
+				modelIDs[modelID] = struct{}{}
+			}
+			data = append(data, newRecord(
+				fqn,
+				peerID+": "+modelID,
+				"",
+				nil,
+				config.ModelCapConfig{},
+				"unloaded",
+				map[string]any{"type": "peer", "peerID": peerID},
+			))
 		}
+	}
+
+	for selectorID, selector := range s.cfg.Selectors {
+		modelIDs[selectorID] = struct{}{}
+		if selector.Unlisted {
+			continue
+		}
+		status := "unloaded"
+		for _, target := range selector.Targets {
+			modelID, local := s.cfg.RealModelName(target)
+			if local {
+				state := running[modelID]
+				if state == process.StateReady || state == process.StateStarting {
+					status = "loaded"
+				}
+			}
+			if selector.Strategy == config.SelectorStrategyPin || status == "loaded" {
+				break
+			}
+		}
+		internalMetadata := map[string]any{
+			"type":     "selector",
+			"strategy": selector.Strategy,
+			"targets":  selector.Targets,
+		}
+		if selector.Strategy == config.SelectorStrategySpillover {
+			internalMetadata["spillover"] = selector.Settings.Spillover
+		}
+		data = append(data, newRecord(
+			selectorID,
+			selector.Name,
+			selector.Description,
+			selector.Metadata,
+			config.ModelCapConfig{},
+			status,
+			internalMetadata,
+		))
 	}
 
 	if profile, ok := s.cfg.Profiles[s.ActiveProfile()]; ok {
@@ -210,15 +287,30 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			if _, shadowsModel := modelIDs[pin]; shadowsModel {
 				continue
 			}
-			data = append(data, newRecord(pin, "", "", nil, config.ModelCapConfig{}, "unloaded"))
+			data = append(data, newRecord(
+				pin,
+				"",
+				"",
+				nil,
+				config.ModelCapConfig{},
+				"unloaded",
+				map[string]any{"type": "profile"},
+			))
 		}
 	}
 
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
-
-	// Echo the Origin so browser clients can read the listing.
-	if origin := r.Header.Get("Origin"); origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+	if isTailcatRequest(r.Context()) {
+		exposed := s.cfg.Tailcat
+		filtered := data[:0]
+		if exposed != nil {
+			for _, record := range data {
+				if tailcatModelAllowed(exposed.Models, record.ID) {
+					filtered = append(filtered, record)
+				}
+			}
+		}
+		data = filtered
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -286,7 +378,12 @@ func (d *discardResponseWriter) Header() http.Header {
 
 func (d *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-func (d *discardResponseWriter) WriteHeader(status int) { d.status = status }
+func (d *discardResponseWriter) WriteHeader(status int) {
+	if swaputil.IsInformationalStatus(status) {
+		return
+	}
+	d.status = status
+}
 
 // startPreload fires a background GET / at every model named in
 // Hooks.OnStartup.Preload so they are warm before the first real request.
@@ -299,25 +396,29 @@ func (s *Server) startPreload() {
 	go func() {
 		for _, modelID := range models {
 			if !s.local.Handles(modelID) {
-				s.proxylog.Warnf("preload: model %s is not a local model, skipping", modelID)
+				s.logs.ProxyLogs.Warnf("preload: model %s is not a local model, skipping", modelID)
 				continue
 			}
-			s.proxylog.Infof("preloading model: %s", modelID)
+			if s.pause.Paused() {
+				s.logs.ProxyLogs.Infof("preload: inference is paused, skipping model %s", modelID)
+				continue
+			}
+			s.logs.ProxyLogs.Infof("preloading model: %s", modelID)
 
 			req, err := http.NewRequestWithContext(s.shutdownCtx, http.MethodGet, "/", nil)
 			if err != nil {
 				continue
 			}
-			req = req.WithContext(shared.SetContext(req.Context(), shared.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
+			req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: modelID, ModelID: modelID, Metadata: make(map[string]string)}))
 
 			dw := &discardResponseWriter{status: http.StatusOK}
 			s.local.ServeHTTP(dw, req)
 
 			success := dw.status < http.StatusBadRequest
 			if !success {
-				s.proxylog.Errorf("failed to preload model %s: status %d", modelID, dw.status)
+				s.logs.ProxyLogs.Errorf("failed to preload model %s: status %d", modelID, dw.status)
 			}
-			event.Emit(shared.ModelPreloadedEvent{ModelName: modelID, Success: success})
+			event.Emit(swaputil.ModelPreloadedEvent{ModelName: modelID, Success: success})
 		}
 	}()
 }
@@ -338,12 +439,28 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func handleRootRedirect(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/ui", http.StatusFound)
+// redirectRelative sends a redirect whose Location header stays relative to
+// the URL the client requested. http.Redirect resolves its destination
+// against the server-visible request path, which drops the path prefix when
+// llama-swap runs behind a prefix-stripping reverse proxy (a browser resolves
+// a relative Location against the URL it actually asked for, so the prefix
+// survives). Target must not start with "/".
+func redirectRelative(w http.ResponseWriter, target string, code int) {
+	w.Header().Set("Location", target)
+	w.WriteHeader(code)
 }
 
+func handleRootRedirect(w http.ResponseWriter, r *http.Request) {
+	redirectRelative(w, "ui/", http.StatusFound)
+}
+
+// handleUpstreamRedirect sends /upstream to the Models page. The target uses
+// the hash router (ui/#/models) so the document stays mounted at <prefix>/ui/:
+// a path route (ui/models) would leave the UI's prefix detection in
+// ui/src/lib/apiPath.ts unable to recover the proxy prefix, disconnecting the
+// page behind a prefix-stripping reverse proxy.
 func handleUpstreamRedirect(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/ui/models", http.StatusFound)
+	redirectRelative(w, "ui/#/models", http.StatusFound)
 }
 
 // handleUpstream proxies ANY request under /upstream/<model>/<path> directly to
@@ -351,31 +468,45 @@ func handleUpstreamRedirect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	upstreamPath := r.PathValue("upstreamPath")
 
-	searchName, modelID, remainingPath, found := shared.FindModelInPath(s.cfg, "/"+upstreamPath)
+	searchName, modelID, remainingPath, found := swaputil.FindModelInPath(s.cfg, "/"+upstreamPath)
 	if !found {
-		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
 		return
 	}
 
 	// Redirect /upstream/model to /upstream/model/ so relative URLs in upstream
-	// responses resolve. 301 for GET/HEAD, 308 otherwise to preserve the method.
+	// responses resolve. The Location stays relative so the redirect keeps a
+	// reverse proxy's path prefix (see redirectRelative). 301 for GET/HEAD,
+	// 308 otherwise to preserve the method.
+	//
+	// The target is built from the last escaped segment of the requested URL,
+	// not from searchName: a slash name ("author/model") arriving as two
+	// segments would resolve "author/model/" against /upstream/author/ and
+	// double the path, and a colon alias ("model1:high") would parse as a URL
+	// scheme (RFC 3986 4.2). "./<segment>/" stays path-relative for both, and
+	// reusing the escaped segment keeps %2F-encoded names redirecting to the
+	// URL the client actually requested.
 	if remainingPath == "/" && !strings.HasSuffix(r.URL.Path, "/") {
-		newPath := "/upstream/" + searchName + "/"
+		escapedPath := r.URL.EscapedPath()
+		newPath := "./" + escapedPath[strings.LastIndex(escapedPath, "/")+1:] + "/"
 		if r.URL.RawQuery != "" {
 			newPath += "?" + r.URL.RawQuery
 		}
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
-			http.Redirect(w, r, newPath, http.StatusMovedPermanently)
+			redirectRelative(w, newPath, http.StatusMovedPermanently)
 		} else {
-			http.Redirect(w, r, newPath, http.StatusPermanentRedirect)
+			redirectRelative(w, newPath, http.StatusPermanentRedirect)
 		}
 		return
 	}
 
-	// Strip the /upstream/<model> prefix before forwarding.
+	// Strip the /upstream/<model> prefix before forwarding. URL.Path is decoded,
+	// so retain the matching escaped suffix in RawPath for the reverse proxy.
+	escapedRemaining := swaputil.EscapedPathSuffix(r.URL.EscapedPath(), "/upstream/"+searchName)
 	r.URL.Path = remainingPath
+	r.URL.RawPath = escapedRemaining
 	// Pin the resolved model so the router skips body/query extraction.
-	*r = *r.WithContext(shared.SetContext(r.Context(), shared.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
+	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
 
 	// If the path matches an upstream.ignorePaths entry and the model is
 	// not already loaded, refuse the request without triggering a swap. The
@@ -388,7 +519,7 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 		if s.local.Handles(modelID) {
 			state, ok := s.local.RunningModels()[modelID]
 			if !ok || state != process.StateReady {
-				shared.SendResponse(w, r, http.StatusConflict,
+				swaputil.SendResponse(w, r, http.StatusConflict,
 					fmt.Sprintf("model %s is not loaded; path matches upstream.ignorePaths", modelID))
 				return
 			}
@@ -401,10 +532,10 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case s.local.Handles(modelID):
-		s.local.ServeHTTP(w, r)
+		s.serveLocal(w, r)
 	case s.peer.Handles(modelID):
 		s.peer.ServeHTTP(w, r)
 	default:
-		shared.SendResponse(w, r, http.StatusNotFound, "no router for model "+modelID)
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no router for model "+modelID)
 	}
 }

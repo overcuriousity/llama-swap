@@ -1,0 +1,102 @@
+# Grounded in docs/kb/guides/routing/groups-and-matrix.md and profiles-and-selectors.md
+- id: routing-three-routers
+  question: What routing engines does llama-swap have and how do I choose one?
+  tags: [routing]
+  expect_regex: ["group", "matrix", "capacity"]
+  expect_any: ["routing", "router"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    `group`, `matrix` and `capacity`, selected with `routing.router.use`.
+    group is the default and simpler; matrix takes a list of allowed concurrent
+    combinations and solves for the cheapest way to satisfy a request; capacity
+    allows any combination that fits declared resource pools.
+  rubric:
+    - Names group, matrix and capacity
+    - Shows or names routing.router.use as the selector
+
+- id: routing-group-flags
+  question: What do the swap and exclusive flags do on a llama-swap group?
+  tags: [routing]
+  expect_regex: ["swap", "exclusive"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    `swap` controls how members behave among themselves: true means one at a
+    time, false means they all coexist. `exclusive` controls the group's effect
+    on other groups: true means loading a member unloads everything else.
+  rubric:
+    - Says swap governs behaviour among members of the same group
+    - Says exclusive governs whether loading a member unloads other groups
+
+- id: routing-model-many-groups
+  question: Can one model be a member of two different groups in llama-swap?
+  tags: [routing]
+  expect_any: ["only one", "one group", "cannot", "can't", "no"]
+  expect_tools: [docs__search_docs]
+  max_iterations: 8
+  reference: |
+    No. A model can belong to only one group.
+  rubric:
+    - Answers no
+    - States a model may belong to only one group
+
+- id: routing-persistent-group
+  question: How do I keep an embeddings model loaded so nothing else ever unloads it?
+  tags: [routing]
+  expect_any: ["persistent", "ttl", "resident"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    Put it in a group with `persistent: true`. Other groups can never unload a
+    persistent group. Pair with `ttl: 0` to stop TTL unloading it too.
+  rubric:
+    - Names the persistent group flag
+    - Shows a yaml snippet with persistent true
+
+- id: routing-profiles-vs-selectors
+  question: What is the difference between a profile and a selector in llama-swap?
+  tags: [routing, profiles]
+  expect_regex: ["profile", "selector"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    A profile switches a whole set of pinned models at runtime. A selector
+    resolves a virtual model ID to a real one per request, using a strategy
+    such as spillover.
+  rubric:
+    - Describes profiles as switching a set of models at runtime
+    - Describes selectors as resolving a virtual model id per request
+
+- id: routing-capacity-pools
+  question: I want any combination of models to run as long as they fit in my RAM, without listing the combinations. How?
+  tags: [routing, capacity]
+  expect_regex: ["capacity", "pools", "capacities"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    Use the capacity router: `routing.router.use: capacity`, declare limits
+    under `routing.router.settings.capacity.pools`, and give each model
+    `capacities` in the same unit.
+  rubric:
+    - Selects the capacity router
+    - Shows pools and per-model capacities
+
+- id: routing-selector-warm
+  question: Which selector strategy uses whatever model is already loaded instead of making me wait?
+  tags: [routing, selectors]
+  expect_regex: ["warm"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    `warm`: the first target already ready, then one already starting, and
+    failing that a cold start of the first.
+  rubric:
+    - Names the warm strategy
+    - Describes the ready, then starting, then cold start order
+
+- id: routing-queue-priority
+  question: How do I make queued requests for my interactive model go ahead of batch model requests?
+  tags: [routing, scheduler]
+  expect_regex: ["priority"]
+  expect_tools: [docs__search_docs]
+  reference: |
+    Set `routing.scheduler.settings.fifo.priority` per model. Higher numbers
+    are serviced first and models default to 0.
+  rubric:
+    - Shows the fifo priority block
+    - Says higher numbers go first

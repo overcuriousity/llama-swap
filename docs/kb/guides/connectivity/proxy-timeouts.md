@@ -2,9 +2,9 @@
 title: Proxy and model startup timeouts
 summary: Distinguish client proxy timeouts from health-check and model startup failures, and fix 502 EOF errors after streams.
 category: guides
-tags: [proxy, timeout, health-check, loading, keep-alive, 502, eof]
-config_keys: [healthCheckTimeout, models.*.proxy, models.*.checkEndpoint, models.*.timeouts.idleConn, models.*.disableKeepAlives]
-updated: 2026-10-07
+tags: [proxy, timeout, health-check, loading, keep-alive, 502, 504, eof, runaway]
+config_keys: [healthCheckTimeout, models.*.proxy, models.*.checkEndpoint, models.*.timeouts.idleConn, models.*.disableKeepAlives, models.*.requestTimeout]
+updated: 2026-11-12
 ---
 
 # Proxy and model startup timeouts
@@ -38,3 +38,26 @@ models:
 Every request then opens a new connection, so `timeouts.idleConn` no longer
 does anything for that model. The extra connect costs well under a millisecond
 on localhost; leave it off for upstreams that do not show the error.
+
+## Stopping runaway requests with requestTimeout
+
+`requestTimeout` caps how long one request to a model may take, in seconds.
+When it passes, the request is cancelled and the model process is stopped, so
+a generation stuck in a loop stops holding the GPU. The next request starts the
+model again.
+
+```yaml
+models:
+  my-model:
+    cmd: llama-server --port ${PORT} -m model.gguf
+    requestTimeout: 300
+```
+
+- `0` (the default) means no limit.
+- A client that has not received a response yet gets a `504` naming the
+  timeout. A stream that already started is cut off mid-response.
+- The whole process is stopped, so other requests running on the same model
+  at that moment fail too. Set it well above your longest legitimate request,
+  including prompt processing of long contexts.
+- To bound generation length without killing the process, cap `max_tokens`
+  with `filters.setParams` instead.

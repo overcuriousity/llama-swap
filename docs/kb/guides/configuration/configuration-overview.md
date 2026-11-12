@@ -81,3 +81,16 @@ something to read top to bottom.
 - `guides/model-runtime/capabilities-and-model-listings` — what `capabilities` does and doesn't do
 - `guides/model-runtime/troubleshooting-model-wont-load` — when a model won't start
 - `reference/config/*` — every setting in `config.example.yaml`, searchable by section
+
+
+## Editing the config in the web UI
+
+When llama-swap is started with `-config`, the **Config** page in the UI
+shows that file next to `config.example.yaml` and can save changes. A save is
+validated first, together with any `-config-dir` files, and rejected if the
+config would not load. A valid save is written atomically and reloads the
+config immediately, even without `-watch-config`.
+
+The editor only accepts requests from the llama-swap UI itself, not from other
+sites. Anyone who can reach the API can still change the config, including the
+commands it runs, so set `apiKeys` on any llama-swap reachable by others.

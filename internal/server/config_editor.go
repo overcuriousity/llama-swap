@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -158,7 +157,9 @@ func (s *Server) handleAPIConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	// fails once merged would otherwise be accepted here and then rejected by
 	// the reload, leaving a file on disk that the next restart cannot load.
 	if _, err := config.LoadConfigSources(tmpName, s.configSource.Dir); err != nil {
-		swaputil.SendResponse(w, r, http.StatusBadRequest, fmt.Sprintf("invalid config: %v", err))
+		// Name the user's file in the message, not the temp copy.
+		msg := strings.ReplaceAll(err.Error(), tmpName, path)
+		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid config: "+msg)
 		return
 	}
 

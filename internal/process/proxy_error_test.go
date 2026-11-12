@@ -164,3 +164,29 @@ func TestProcessCommand_ProxyErrorHandler(t *testing.T) {
 		}
 	})
 }
+
+// requestTimeout cancels the request with a deadline. The client is still
+// connected and must be told the request timed out, not that the upstream
+// failed.
+func TestProcessCommand_ProxyErrorHandlerRequestTimeout(t *testing.T) {
+	logger := logmon.NewWriter(io.Discard)
+	handler := newProxyErrorHandler("m", logger)
+
+	clientCtx := context.Background()
+	ctx, cancel := context.WithTimeout(swaputil.SetClientContext(clientCtx, clientCtx), 0)
+	defer cancel()
+	<-ctx.Done()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	r.Header.Set("Accept", "application/json")
+
+	w := httptest.NewRecorder()
+	rec := &markerRecorder{ResponseWriter: w, status: http.StatusOK}
+	handler(rec, r, context.DeadlineExceeded)
+
+	if rec.status != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", rec.status, http.StatusGatewayTimeout)
+	}
+	if !strings.Contains(w.Body.String(), "request timeout exceeded") {
+		t.Errorf("body = %q, want it to mention the request timeout", w.Body.String())
+	}
+}

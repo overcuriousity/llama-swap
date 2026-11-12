@@ -58,6 +58,15 @@ func newProxyErrorHandler(id string, proxyLogger *logmon.Monitor) func(http.Resp
 		if swaputil.MarkClientClosed(w, r) || swaputil.ResponseStarted(w) {
 			return
 		}
+		// A deadline on the request context is requestTimeout (or one set by
+		// a caller further up) cutting the request short. The client is still
+		// waiting and the upstream did nothing wrong, so it gets a 504 that
+		// says why instead of an empty 502.
+		if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+			swaputil.SendResponse(w, r, http.StatusGatewayTimeout,
+				fmt.Sprintf("[%s] request timeout exceeded", id))
+			return
+		}
 		w.WriteHeader(http.StatusBadGateway)
 	}
 }

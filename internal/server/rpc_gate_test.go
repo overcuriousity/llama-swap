@@ -87,3 +87,20 @@ func TestServer_DispatchAllowsHealthyRPC(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
 }
+
+// The /upstream passthrough dispatches through serveLocal as well, so it must
+// not be a way around the RPC gate.
+func TestServer_UpstreamRejectsUnhealthyRPC(t *testing.T) {
+	local := newStubRouter([]string{"broken"}, "upstream response")
+	local.unhealthyRPC = map[string]bool{"broken": true}
+
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"broken": {}}}
+
+	w := httptest.NewRecorder()
+	s.handler.ServeHTTP(w, httptest.NewRequest("GET", "/upstream/broken/props", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+	}
+}

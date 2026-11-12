@@ -297,6 +297,7 @@ func main() {
 	configSource := server.ConfigSource{Example: example}
 	if *flagConfig != "" {
 		configSource.Path = *flagConfig
+		configSource.Dir = *flagConfigDir
 	}
 	initialSrv.SetConfigSource(configSource)
 

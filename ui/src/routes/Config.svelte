@@ -4,7 +4,8 @@
   import { EditorView, basicSetup } from "codemirror";
   import { yaml } from "@codemirror/lang-yaml";
   import { EditorState, Compartment } from "@codemirror/state";
-  import * as jsyaml from "js-yaml";
+  import { parse as parseYaml } from "yaml";
+  import { apiUrl } from "../lib/apiPath";
 
   let currentConfig = $state("");
   let exampleConfig = $state("");
@@ -21,9 +22,25 @@
   let themeCompartment = new Compartment();
   let exampleThemeCompartment = new Compartment();
 
+  // errorMessage reads an error response once and extracts the message from
+  // the OpenAI-style envelope ({"error": {"message": ...}}) the server sends,
+  // falling back to the raw body.
+  async function errorMessage(res: Response): Promise<string> {
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      const err = data?.error;
+      if (typeof err === "string") return err;
+      if (err && typeof err.message === "string") return err.message;
+    } catch {
+      // not JSON
+    }
+    return text.trim();
+  }
+
   function validateYAML(text: string): string | null {
     try {
-      jsyaml.load(text);
+      parseYaml(text);
       return null;
     } catch (e) {
       return e instanceof Error ? e.message : "Invalid YAML";
@@ -114,15 +131,15 @@
     validationError = "";
     try {
       const [currentRes, exampleRes] = await Promise.all([
-        fetch("/api/config/current"),
-        fetch("/api/config/example"),
+        fetch(apiUrl("/api/config/current")),
+        fetch(apiUrl("/api/config/example")),
       ]);
 
       if (!currentRes.ok) {
-        throw new Error(`Failed to load current config: ${currentRes.statusText}`);
+        throw new Error(`Failed to load current config: ${(await errorMessage(currentRes)) || currentRes.statusText}`);
       }
       if (!exampleRes.ok) {
-        throw new Error(`Failed to load example config: ${exampleRes.statusText}`);
+        throw new Error(`Failed to load example config: ${(await errorMessage(exampleRes)) || exampleRes.statusText}`);
       }
 
       currentConfig = await currentRes.text();
@@ -149,21 +166,14 @@
     saving = true;
     error = "";
     try {
-      const res = await fetch("/api/config", {
+      const res = await fetch(apiUrl("/api/config"), {
         method: "POST",
         headers: { "Content-Type": "text/yaml" },
         body: currentConfig,
       });
 
       if (!res.ok) {
-        let errMsg: string;
-        try {
-          const errData = await res.json();
-          errMsg = errData.error || JSON.stringify(errData);
-        } catch {
-          errMsg = await res.text();
-        }
-        throw new Error(`${res.status} ${res.statusText}: ${errMsg || "Failed to save config"}`);
+        throw new Error(`${res.status} ${res.statusText}: ${(await errorMessage(res)) || "Failed to save config"}`);
       }
 
       alert("Config saved successfully! Application is reloading...");
